@@ -336,6 +336,23 @@ impl<'a> Btrfs<'a> {
         Ok(Some(btrfs))
     }
 
+    pub fn get_label(&self) -> String {
+        let label_slice = &self.sb.label;
+        let end = label_slice
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(label_slice.len());
+        String::from_utf8_lossy(&label_slice[..end]).into_owned()
+    }
+
+    pub fn get_uuid(&self) -> String {
+        let u = self.sb.fsid;
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]
+        )
+    }
+
     fn load_chunk_tree(&mut self) -> Result<()> {
         let chunk_root_logical = self.sb.chunk_root;
         let node_size = self.sb.nodesize as usize;
@@ -575,44 +592,21 @@ impl<'a> Btrfs<'a> {
         }
     }
 
-    // Get the FS Tree Root
-    pub fn get_fs_root(&mut self) -> Result<u64> {
-        let key = BtrfsKey::new(BTRFS_FS_TREE_OBJECTID, BTRFS_ROOT_ITEM_KEY, 0);
-        let k_obj = key.objectid;
-        let k_type = key.type_;
-        let k_off = key.offset;
-        let sb_root = self.sb.root;
-        crate::debug!(
-            "Btrfs: Searching for FS Root key ({}, {}, {}) in Root Tree at {:#x}",
-            k_obj,
-            k_type,
-            k_off,
-            sb_root
-        );
-
-        // Root Tree is at self.sb.root
-        // BUT: For default subvolume we might need to look at BTRFS_FS_TREE_OBJECTID in Root Tree
-        // The Superblock points to the Root Tree (Object ID 1).
-
-        // Actually, often the default FS Tree is Object ID 5.
-        // We need to look up Key(5, ROOT_ITEM, 0) inside the tree at `self.sb.root`.
-
+    pub fn get_tree_root(&mut self, tree_id: u64) -> Result<u64> {
+        let key = BtrfsKey::new(tree_id, BTRFS_ROOT_ITEM_KEY, 0);
         if let Some((leaf, item)) = self.search_slot(self.sb.root, &key)? {
-            // Read Root Item data
-            // Standard: Data is at NodePtr + sizeof(Header) + item.offset
-            // See fsw_btrfs.c: data = (char*)h + sizeof(*h) + it->offset;
-
             let data_ptr =
                 leaf.as_ptr() as usize + mem::size_of::<BtrfsHeader>() + item.offset as usize;
             let root_item = unsafe { (data_ptr as *const BtrfsRootItem).read_unaligned() };
-
             Ok(root_item.bytenr)
         } else {
-            // Fallback: Sometimes FS Tree root is explicitly set in older Btrfs?
-            // Or maybe we can't find it because our sys_chunks are incomplete.
-            // Assuming 5 for simple test
             Err(Error::new(Status::NOT_FOUND, ()))
         }
+    }
+
+    // Get the FS Tree Root
+    pub fn get_fs_root(&mut self) -> Result<u64> {
+        self.get_tree_root(BTRFS_FS_TREE_OBJECTID)
     }
 
     pub fn read_file(&mut self, fs_root_logical: u64, inode: u64) -> Result<Vec<u8>> {
@@ -621,6 +615,14 @@ impl<'a> Btrfs<'a> {
             let data_ptr =
                 leaf.as_ptr() as usize + mem::size_of::<BtrfsHeader>() + item.offset as usize;
             let extent = unsafe { (data_ptr as *const BtrfsFileExtentItem).read_unaligned() };
+
+            if extent.compression != 0 {
+                crate::error!(
+                    "Btrfs: Compressed file detected (algo {}). Only uncompressed files supported.",
+                    extent.compression
+                );
+                return Err(Error::new(Status::UNSUPPORTED, ()));
+            }
 
             if extent.type_ == BTRFS_FILE_EXTENT_INLINE {
                 let inline_data_ptr = data_ptr + mem::size_of::<BtrfsFileExtentItem>();
@@ -658,7 +660,7 @@ impl<'a> Btrfs<'a> {
         fs_root_logical: u64,
         dir_objectid: u64,
         name_to_find: &str,
-    ) -> Result<Option<u64>> {
+    ) -> Result<Option<(u64, u8)>> {
         let node_size = self.sb.nodesize as usize;
         let mut node_buf = vec![0u8; node_size];
 
@@ -702,7 +704,7 @@ impl<'a> Btrfs<'a> {
                         unsafe { slice::from_raw_parts(name_ptr as *const u8, name_len) };
 
                     if name_slice == name_to_find.as_bytes() {
-                        return Ok(Some(dir_item.location.objectid));
+                        return Ok(Some((dir_item.location.objectid, dir_item.location.type_)));
                     }
                 }
             }

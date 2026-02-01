@@ -146,15 +146,38 @@ pub extern "C" fn efi_main(
 
     // Add drives
     for handle in handles.iter() {
-        if let Ok(block_io) = uefi::boot::open_protocol_exclusive::<BlockIO>(*handle) {
-            let media = block_io.media();
-            if media.is_media_present() {
-                let size_gb = media.block_size() as u64 * media.last_block() / (1024 * 1024 * 1024);
-                let name = if media.is_removable_media() {
+        if let Ok(mut block_io) = uefi::boot::open_protocol_exclusive::<BlockIO>(*handle) {
+            let (is_present, size_gb, is_removable) = {
+                let media = block_io.media();
+                (
+                    media.is_media_present(),
+                    media.block_size() as u64 * media.last_block() / (1024 * 1024 * 1024),
+                    media.is_removable_media(),
+                )
+            };
+            // empty drives are skipped
+            if size_gb == 0 {
+                continue;
+            }
+            if is_present {
+                let mut label_name = None;
+
+                // Try to read Btrfs label
+                if let Ok(Some(btrfs)) = fs::btrfs::Btrfs::new(&mut block_io) {
+                    let label = btrfs.get_label();
+                    if !label.is_empty() {
+                        label_name = Some(format!("{} ({}GB)", label, size_gb));
+                    }
+                }
+
+                let name = if let Some(l) = label_name {
+                    l
+                } else if is_removable {
                     format!("Removable {}GB", size_gb)
                 } else {
                     format!("HDD {}GB", size_gb)
                 };
+
                 menu_items.push(MenuItem::Drive {
                     name,
                     handle: Some(*handle),
@@ -419,13 +442,15 @@ pub extern "C" fn efi_main(
                                                 crate::info!("Btrfs detected. Searching for /Core/Boot/vmlinuz-linux...");
 
                                                 let res = (|| -> uefi::Result<()> {
-                                                    let fs_root = btrfs.get_fs_root()?;
-                                                    let root_dir_id = 256;
+                                                    let mut current_fs_root =
+                                                        btrfs.get_fs_root()?;
+                                                    let mut current_dir_id = 256;
 
-                                                    let core_id = btrfs
+                                                    // 1. Find Core
+                                                    let (core_obj, core_type) = btrfs
                                                         .find_file_in_dir(
-                                                            fs_root,
-                                                            root_dir_id,
+                                                            current_fs_root,
+                                                            current_dir_id,
                                                             "Core",
                                                         )?
                                                         .ok_or(uefi::Error::new(
@@ -433,17 +458,37 @@ pub extern "C" fn efi_main(
                                                             (),
                                                         ))?;
 
-                                                    let boot_id = btrfs
-                                                        .find_file_in_dir(fs_root, core_id, "Boot")?
+                                                    // Check if it is a subvolume (Root Item Key = 132)
+                                                    if core_type == fs::btrfs::BTRFS_ROOT_ITEM_KEY {
+                                                        crate::info!(
+                                                            "Entering subvolume Core (ID {})",
+                                                            core_obj
+                                                        );
+                                                        current_fs_root =
+                                                            btrfs.get_tree_root(core_obj)?;
+                                                        current_dir_id = 256; // Root of new tree
+                                                    } else {
+                                                        // Just a directory
+                                                        current_dir_id = core_obj;
+                                                    }
+
+                                                    // 2. Find Boot
+                                                    let (boot_obj, _) = btrfs
+                                                        .find_file_in_dir(
+                                                            current_fs_root,
+                                                            current_dir_id,
+                                                            "Boot",
+                                                        )?
                                                         .ok_or(uefi::Error::new(
                                                             uefi::Status::NOT_FOUND,
                                                             (),
                                                         ))?;
 
-                                                    let kernel_id = btrfs
+                                                    // 3. Find vmlinuz-linux
+                                                    let (kernel_obj, _) = btrfs
                                                         .find_file_in_dir(
-                                                            fs_root,
-                                                            boot_id,
+                                                            current_fs_root,
+                                                            boot_obj,
                                                             "vmlinuz-linux",
                                                         )?
                                                         .ok_or(uefi::Error::new(
@@ -452,18 +497,20 @@ pub extern "C" fn efi_main(
                                                         ))?;
 
                                                     // Also try to find initramfs just to check existence
-                                                    let initrd_id = btrfs.find_file_in_dir(
-                                                        fs_root,
-                                                        boot_id,
+                                                    let initrd_res = btrfs.find_file_in_dir(
+                                                        current_fs_root,
+                                                        boot_obj,
                                                         "initramfs-linux.img",
                                                     )?;
 
-                                                    if let Some(initrd_inode) = initrd_id {
+                                                    if let Some((initrd_inode, _)) = initrd_res {
                                                         crate::info!(
                                                             "Found initramfs-linux.img, loading..."
                                                         );
-                                                        let initrd_data = btrfs
-                                                            .read_file(fs_root, initrd_inode)?;
+                                                        let initrd_data = btrfs.read_file(
+                                                            current_fs_root,
+                                                            initrd_inode,
+                                                        )?;
                                                         crate::info!(
                                                             "Initrd loaded ({} bytes).",
                                                             initrd_data.len()
@@ -549,8 +596,8 @@ pub extern "C" fn efi_main(
                                                     }
 
                                                     crate::info!("Reading kernel...");
-                                                    let kernel_data =
-                                                        btrfs.read_file(fs_root, kernel_id)?;
+                                                    let kernel_data = btrfs
+                                                        .read_file(current_fs_root, kernel_obj)?;
                                                     crate::info!(
                                                         "Kernel loaded ({} bytes). Starting...",
                                                         kernel_data.len()
@@ -572,8 +619,12 @@ pub extern "C" fn efi_main(
                                                             handle
                                                         )?;
 
-                                                    // Command line: root=/dev/vda rw console=ttyS0
-                                                    let cmdline = "root=/dev/vda rw console=ttyS0";
+                                                    // Command line: root=UUID=... rw rootflags=compress=zstd:1 init=/Core/sbin/init console=ttyS0
+                                                    let uuid = btrfs.get_uuid();
+                                                    let cmdline = format!(
+                                                        "root=UUID={} rw rootflags=compress=zstd:1 init=/Core/sbin/init console=ttyS0",
+                                                        uuid
+                                                    );
                                                     let mut cmdline_utf16: Vec<u16> =
                                                         cmdline.encode_utf16().collect();
                                                     cmdline_utf16.push(0); // Null terminate

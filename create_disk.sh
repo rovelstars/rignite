@@ -1,7 +1,9 @@
 #!/bin/bash
 
 # create a raw disk image of 2G, format it with btrfs filesystem.
-# mount it to temporary directory and add Linux boot files.
+# Setup subvolumes @core and @home.
+# Enable ZSTD compression globally.
+# Disable compression/CoW for Boot directory to ensure compatibility with simple bootloaders.
 # This script requires sudo privileges to run.
 
 IMAGE="disk.img"
@@ -14,7 +16,9 @@ fi
 
 # Clean up previous run
 if [ -d "$MOUNT_DIR" ]; then
-    umount "$MOUNT_DIR" 2>/dev/null
+    if mountpoint -q "$MOUNT_DIR"; then
+        umount "$MOUNT_DIR"
+    fi
     rm -rf "$MOUNT_DIR"
 fi
 rm -f "$IMAGE"
@@ -22,15 +26,31 @@ rm -f "$IMAGE"
 echo "Creating 2G raw disk image..."
 qemu-img create -f raw "$IMAGE" 2G
 
-echo "Formatting as Btrfs..."
-mkfs.btrfs "$IMAGE"
+echo "Formatting as Btrfs (Label: RunixOS)..."
+mkfs.btrfs --label "RunixOS" "$IMAGE"
 
-echo "Mounting image..."
+echo "Mounting image with zstd compression..."
 mkdir -p "$MOUNT_DIR"
-mount -o loop "$IMAGE" "$MOUNT_DIR"
+# Mount with compress=zstd:1. All new files will be compressed unless configured otherwise.
+mount -o loop,compress=zstd:1 "$IMAGE" "$MOUNT_DIR"
 
-echo "Creating /Core/Boot structure..."
+echo "Creating Btrfs Subvolumes..."
+btrfs subvolume create "$MOUNT_DIR/Core"
+btrfs subvolume create "$MOUNT_DIR/Home"
+
+echo "Setting up Boot directory with NoCOW (+C)..."
+# Create Boot directory inside Core
 mkdir -p "$MOUNT_DIR/Core/Boot"
+
+# Apply NoCOW attribute (+C).
+# This disables Copy-on-Write and Compression for this directory and new files inside it.
+# Essential for bootloaders that don't support Btrfs compression/encryption.
+chattr +C "$MOUNT_DIR/Core/Boot"
+
+echo "Verifying attributes on Boot folder:"
+lsattr -d "$MOUNT_DIR/Core/Boot"
+
+echo "Populating Core/Boot..."
 
 # Define paths to copy from
 KERNEL_SRC="/boot/vmlinuz-linux"
@@ -66,8 +86,77 @@ else
     fi
 fi
 
-echo "Listing contents:"
-ls -R "$MOUNT_DIR"
+echo "Copying ROS Environment..."
+ROS_SRC="/home/ren/ROS"
+if [ -d "$ROS_SRC" ]; then
+    echo "Copying contents of $ROS_SRC to $MOUNT_DIR..."
+    cp -a "$ROS_SRC/." "$MOUNT_DIR/"
+    # Ensure root ownership for system files
+    chown -R root:root "$MOUNT_DIR"
+else
+    echo "WARNING: $ROS_SRC not found. Skipping copy."
+fi
+
+# Ensure standard directories exist if ROS didn't provide them
+mkdir -p "$MOUNT_DIR/Core/"{etc,usr,var,bin,sbin,lib64}
+mkdir -p "$MOUNT_DIR/Home/user"
+
+# Install bash and dependencies
+BASH_BIN=$(command -v bash)
+if [ -z "$BASH_BIN" ]; then
+    echo "Error: bash not found on host."
+    exit 1
+fi
+
+echo "Installing bash from $BASH_BIN..."
+cp "$BASH_BIN" "$MOUNT_DIR/Core/bin/bash"
+
+# Copy dependencies
+echo "Copying bash dependencies..."
+ldd "$BASH_BIN" | grep -o '/[^ ]*' | while read -r lib; do
+    # Determine destination dir inside Core, preserving path structure
+    # e.g. /usr/lib/libc.so.6 -> $MOUNT_DIR/Core/usr/lib/libc.so.6
+    dest_dir="$MOUNT_DIR/Core$(dirname "$lib")"
+    mkdir -p "$dest_dir"
+    cp "$lib" "$dest_dir/"
+done
+
+# Create the init script
+echo "Creating bash init script..."
+cat <<EOF > "$MOUNT_DIR/Core/sbin/init"
+#!/bin/bash
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/Core/Bin
+echo "Successfully booted into RigniteOS (Bash Mode)!"
+echo "Dropping to shell..."
+exec /bin/bash --login
+EOF
+chmod +x "$MOUNT_DIR/Core/sbin/init"
+
+# Create root symlinks to point into Core
+# This ensures that paths like /bin/bash (used in shebang) resolve to /Core/bin/bash
+ln -sf Core/sbin "$MOUNT_DIR/sbin"
+ln -sf Core/bin "$MOUNT_DIR/bin"
+ln -sf Core/lib "$MOUNT_DIR/lib"
+ln -sf Core/lib64 "$MOUNT_DIR/lib64"
+ln -sf Core/usr "$MOUNT_DIR/usr"
+ln -sf Core/etc "$MOUNT_DIR/etc"
+
+# Add a dummy fstab
+echo "# /etc/fstab: static file system information." > "$MOUNT_DIR/Core/etc/fstab"
+echo "LABEL=RunixOS / btrfs rw,relatime,compress=zstd:1 0 0" >> "$MOUNT_DIR/Core/etc/fstab"
+
+# Add a dummy hostname
+echo "runixos-desktop" > "$MOUNT_DIR/Core/etc/hostname"
+
+# Add some compressed data to verify zstd is working elsewhere
+echo "This is some user data that should be compressed by ZSTD." > "$MOUNT_DIR/Home/user/document.txt"
+# Create a larger file to ensure compression triggers
+for i in {1..1000}; do echo "Repeated text for compression testing $i"; done >> "$MOUNT_DIR/Home/user/large_log.txt"
+
+echo "Listing contents of root (subvolumes are visible as directories):"
+ls -F "$MOUNT_DIR"
+echo "Listing contents of Core/Boot:"
+ls -lh "$MOUNT_DIR/Core/Boot"
 
 echo "Unmounting..."
 umount "$MOUNT_DIR"
@@ -76,4 +165,9 @@ rm -rf "$MOUNT_DIR"
 # Fix permissions so regular user can read it for QEMU
 chmod 666 "$IMAGE"
 
-echo "Done. Created $IMAGE with Btrfs and Linux boot files."
+echo "Done. Created $IMAGE with:"
+echo "  - Btrfs filesystem (Label: RunixOS)"
+echo "  - ZSTD:1 compression enabled globally"
+echo "  - Subvolumes: Core, Home"
+echo "  - NoCOW/Uncompressed directory: Core/Boot"
+echo "  - Linux boot files installed"
