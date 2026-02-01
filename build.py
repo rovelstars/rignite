@@ -97,7 +97,6 @@ def prepare_assets():
         ("firmware.svg", "firmware.qoi"),
         ("reboot.svg", "reboot.qoi"),
         ("shutdown.svg", "shutdown.qoi"),
-        ("logo.svg", "logo.qoi"),
     ]
 
     for svg_name, raw_name in icons:
@@ -144,6 +143,7 @@ def prepare_assets():
             os.remove(png_path)
         else:
             print(f"Warning: PNG generation failed for {svg_name}")
+
 
 def build_uefi(arch="x86_64"):
     prepare_assets()

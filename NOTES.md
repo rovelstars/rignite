@@ -1,7 +1,7 @@
 # Image optimization
 Initially we were converting svg images to png using rsvg-convert to 512x512 size. But the resulting pngs were quite large (100-200KB each).
 We now convert the PNGs to QOI format, and use a QOI encoder and decoder library to reduce file size from initial 7.5MB EFI image to just 812KB.
-**UPDATE:** I found out that `logo.svg` had a lot of unnecessary details that were not visible at small sizes. I simplified the SVG and re-exported to PNG, then converted to QOI again. This reduced the QOI file from 160KB to just 20KB!
+**UPDATE:** I found out that `logo.svg` had a lot of unnecessary details that were not visible at small sizes. I simplified the SVG, and it turns out it can be procedurally generated with just a few shapes. This completely eliminated the need for any image assets, reducing the EFI image size to just 452KB!
 
 # Switching from ab_glyph to fontdue for font rendering
 The switch to `fontdue` offers faster performance and lower memory usage compared to `ab_glyph`, resulting in a more efficient application.

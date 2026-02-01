@@ -19,6 +19,7 @@ mod graphics;
 mod icons;
 mod input;
 mod logger;
+mod logo;
 
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::RgbColor;
@@ -77,7 +78,6 @@ pub extern "C" fn efi_main(
     let firmware_icon_data = include_bytes!("../assets/firmware.qoi");
     let reboot_icon_data = include_bytes!("../assets/reboot.qoi");
     let shutdown_icon_data = include_bytes!("../assets/shutdown.qoi");
-    let logo_icon_data = include_bytes!("../assets/logo.qoi");
 
     // Init Renderers
     let font_renderer = FontRenderer::new(font_data);
@@ -85,7 +85,7 @@ pub extern "C" fn efi_main(
     let firmware_icon = Icon::new(firmware_icon_data, 512, 512);
     let reboot_icon = Icon::new(reboot_icon_data, 512, 512);
     let shutdown_icon = Icon::new(shutdown_icon_data, 512, 512);
-    let logo_icon = Icon::new(logo_icon_data, 512, 512);
+    let logo_icon = logo::Logo::new();
 
     // Logo Animation
     display
@@ -101,7 +101,7 @@ pub extern "C" fn efi_main(
     for i in 0..=60 {
         display.clear(Rgb888::new(0, 0, 0)).ok();
         let opacity = i as f32 / 60.0;
-        logo_icon.draw_scaled(&mut display, center_x, center_y, logo_size, opacity);
+        logo_icon.draw(&mut display, center_x, center_y, logo_size, opacity);
         display.flush();
         uefi::boot::stall(16_670);
     }
@@ -113,7 +113,7 @@ pub extern "C" fn efi_main(
     for i in (0..=60).rev() {
         display.clear(Rgb888::new(0, 0, 0)).ok();
         let opacity = i as f32 / 60.0;
-        logo_icon.draw_scaled(&mut display, center_x, center_y, logo_size, opacity);
+        logo_icon.draw(&mut display, center_x, center_y, logo_size, opacity);
         display.flush();
         uefi::boot::stall(16_670);
     }

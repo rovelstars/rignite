@@ -15,7 +15,7 @@ if [ "$ARCH" == "x86_64" ]; then
         -drive format=raw,file=fat:rw:$ESP_DIR \
         -drive file=disk.img,if=none,id=drive0,format=raw \
         -device virtio-blk-pci,drive=drive0 \
-        -vga none -device ramfb \
+        -vga std \
         -device qemu-xhci -device usb-kbd -device usb-tablet \
         -display gtk,gl=on -serial stdio \
         -boot menu=on,splash-time=0
