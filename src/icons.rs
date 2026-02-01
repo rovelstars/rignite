@@ -1,18 +1,34 @@
 use crate::graphics::UefiDisplay;
+use alloc::vec;
+use alloc::vec::Vec;
 use embedded_graphics::{pixelcolor::Rgb888, prelude::*};
+use qoi::Decoder;
 
-// Fixed 512x512 source size as per build.py (ultra high quality)
-const ICON_SIZE: u32 = 512;
-
-pub struct Icon<'a> {
-    data: &'a [u8],
+pub struct Icon {
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
-impl<'a> Icon<'a> {
-    pub fn new(data: &'a [u8], _w: u32, _h: u32) -> Self {
-        // Ignore w/h args, assume they define source size or just use constant
-        // For backwards compat with main.rs call, keep args but rely on ICON_SIZE
-        Self { data }
+impl Icon {
+    pub fn new(data: &[u8], _w: u32, _h: u32) -> Self {
+        let mut decoder = Decoder::new(data).expect("Invalid QOI data");
+        let header = decoder.header();
+        let width = header.width;
+        let height = header.height;
+
+        let len = (width as usize) * (height as usize) * 4;
+        let mut pixels = vec![0u8; len];
+
+        decoder
+            .decode_to_buf(&mut pixels)
+            .expect("Failed to decode QOI");
+
+        Self {
+            data: pixels,
+            width,
+            height,
+        }
     }
 
     pub fn draw_scaled(
@@ -24,7 +40,7 @@ impl<'a> Icon<'a> {
         opacity: f32,
     ) {
         // Bicubic scaling (Catmull-Rom) - good balance of speed and quality
-        let scale_factor = (ICON_SIZE as f32) / (target_size as f32);
+        let scale_factor = (self.width as f32) / (target_size as f32);
 
         // Bicubic kernel
         let cubic = |x: f32| -> f32 {
@@ -63,10 +79,10 @@ impl<'a> Icon<'a> {
                 // Sample 4x4 neighborhood for bicubic
                 for dy in -1..=2 {
                     for dx in -1..=2 {
-                        let sample_x = (x0 + dx).max(0).min(ICON_SIZE as i32 - 1) as u32;
-                        let sample_y = (y0 + dy).max(0).min(ICON_SIZE as i32 - 1) as u32;
+                        let sample_x = (x0 + dx).max(0).min(self.width as i32 - 1) as u32;
+                        let sample_y = (y0 + dy).max(0).min(self.height as i32 - 1) as u32;
 
-                        let idx = ((sample_y * ICON_SIZE + sample_x) * 4) as usize;
+                        let idx = ((sample_y * self.width + sample_x) * 4) as usize;
                         if idx + 3 >= self.data.len() {
                             continue;
                         }

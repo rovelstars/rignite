@@ -75,11 +75,11 @@ pub extern "C" fn efi_main(
 
     // Load Resources
     let font_data = include_bytes!("../assets/font.data");
-    let drive_icon_data = include_bytes!("../assets/drive.raw");
-    let firmware_icon_data = include_bytes!("../assets/firmware.raw");
-    let reboot_icon_data = include_bytes!("../assets/reboot.raw");
-    let shutdown_icon_data = include_bytes!("../assets/shutdown.raw");
-    let logo_icon_data = include_bytes!("../assets/logo.raw");
+    let drive_icon_data = include_bytes!("../assets/drive.qoi");
+    let firmware_icon_data = include_bytes!("../assets/firmware.qoi");
+    let reboot_icon_data = include_bytes!("../assets/reboot.qoi");
+    let shutdown_icon_data = include_bytes!("../assets/shutdown.qoi");
+    let logo_icon_data = include_bytes!("../assets/logo.qoi");
 
     // Init Renderers
     let font_renderer = FontRenderer::new(font_data);

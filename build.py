@@ -15,6 +15,70 @@ def run_command(cmd):
     subprocess.check_call(cmd, shell=True)
 
 
+def qoi_encode(rgba, width, height):
+    import struct
+
+    out = bytearray(struct.pack(">4sIIBB", b"qoif", width, height, 4, 1))
+
+    pixels = rgba
+    prev = (0, 0, 0, 255)
+    index = [(0, 0, 0, 0)] * 64
+    run = 0
+
+    # pixels is bytes/bytearray
+
+    for i in range(0, len(pixels), 4):
+        px = tuple(pixels[i : i + 4])
+
+        if px == prev:
+            run += 1
+            if run == 62:
+                out.append(0xC0 | (run - 1))
+                run = 0
+            continue
+
+        if run > 0:
+            out.append(0xC0 | (run - 1))
+            run = 0
+
+        index_pos = (px[0] * 3 + px[1] * 5 + px[2] * 7 + px[3] * 11) % 64
+
+        if index[index_pos] == px:
+            out.append(0x00 | index_pos)
+        elif px[3] == prev[3]:
+            vr = (px[0] - prev[0]) & 0xFF
+            if vr > 127:
+                vr -= 256
+            vg = (px[1] - prev[1]) & 0xFF
+            if vg > 127:
+                vg -= 256
+            vb = (px[2] - prev[2]) & 0xFF
+            if vb > 127:
+                vb -= 256
+
+            vg_r = vr - vg
+            vb_g = vb - vg
+
+            if -2 <= vr <= 1 and -2 <= vg <= 1 and -2 <= vb <= 1:
+                out.append(0x40 | ((vr + 2) << 4) | ((vg + 2) << 2) | (vb + 2))
+            elif -32 <= vg <= 31 and -8 <= vg_r <= 7 and -8 <= vb_g <= 7:
+                out.append(0x80 | (vg + 32))
+                out.append(((vg_r + 8) << 4) | (vb_g + 8))
+            else:
+                out.extend(b"\xfe" + bytes(px[:3]))
+        else:
+            out.extend(b"\xff" + bytes(px))
+
+        prev = px
+        index[index_pos] = px
+
+    if run > 0:
+        out.append(0xC0 | (run - 1))
+
+    out.extend(b"\x00\x00\x00\x00\x00\x00\x00\x01")
+    return out
+
+
 def prepare_assets():
     if not os.path.exists(ASSETS_DIR):
         os.makedirs(ASSETS_DIR)
@@ -29,11 +93,11 @@ def prepare_assets():
 
     # 2. Process Icons (multiple icons now)
     icons = [
-        ("drive-harddisk-root.svg", "drive.raw"),
-        ("firmware.svg", "firmware.raw"),
-        ("reboot.svg", "reboot.raw"),
-        ("shutdown.svg", "shutdown.raw"),
-        ("logo.svg", "logo.raw"),
+        ("drive-harddisk-root.svg", "drive.qoi"),
+        ("firmware.svg", "firmware.qoi"),
+        ("reboot.svg", "reboot.qoi"),
+        ("shutdown.svg", "shutdown.qoi"),
+        ("logo.svg", "logo.qoi"),
     ]
 
     for svg_name, raw_name in icons:
@@ -60,17 +124,23 @@ def prepare_assets():
                 continue
 
         if os.path.exists(png_path):
-            # Convert PNG to Raw RGBA
+            # Convert PNG to QOI
             from PIL import Image
 
             try:
                 img = Image.open(png_path).convert("RGBA")
                 data = img.tobytes()  # RGBA format
+                width, height = img.size
+
+                encoded_data = qoi_encode(data, width, height)
+
                 with open(raw_dst, "wb") as f:
-                    f.write(data)
-                print(f"Generated {raw_name}: {len(data)} bytes")
+                    f.write(encoded_data)
+                print(
+                    f"Generated {raw_name}: {len(encoded_data)} bytes (Raw: {len(data)})"
+                )
             except ImportError:
-                print("Error: PIL/Pillow not installed. Cannot convert to raw.")
+                print("Error: PIL/Pillow not installed. Cannot convert to QOI.")
         else:
             print(f"Warning: PNG generation failed for {svg_name}")
 
