@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+#[macro_use]
 extern crate alloc;
 
 use alloc::format;
@@ -9,12 +10,14 @@ use alloc::vec::Vec;
 use uefi::boot::SearchType;
 use uefi::proto::console::gop::GraphicsOutput;
 use uefi::proto::console::text::{Key, ScanCode};
+use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::block::BlockIO;
 use uefi::runtime::{ResetType, VariableAttributes, VariableVendor};
 use uefi::CStr16;
 use uefi::Identify;
 
 mod font;
+mod fs;
 mod graphics;
 mod icons;
 mod input;
@@ -130,7 +133,10 @@ pub extern "C" fn efi_main(
 
     #[derive(Clone)]
     enum MenuItem {
-        Drive { name: String },
+        Drive {
+            name: String,
+            handle: Option<uefi::Handle>,
+        },
         FirmwareSettings,
         Reboot,
         Shutdown,
@@ -149,7 +155,10 @@ pub extern "C" fn efi_main(
                 } else {
                     format!("HDD {}GB", size_gb)
                 };
-                menu_items.push(MenuItem::Drive { name });
+                menu_items.push(MenuItem::Drive {
+                    name,
+                    handle: Some(*handle),
+                });
             }
         }
     }
@@ -157,6 +166,7 @@ pub extern "C" fn efi_main(
     if menu_items.is_empty() {
         menu_items.push(MenuItem::Drive {
             name: String::from("No Drives Found"),
+            handle: None,
         });
     }
 
@@ -255,7 +265,7 @@ pub extern "C" fn efi_main(
 
                 let mut drive_idx = 0;
                 for (i, item) in menu_items.iter().enumerate() {
-                    if let MenuItem::Drive { name } = item {
+                    if let MenuItem::Drive { name, .. } = item {
                         let (x, y) = if is_vertical {
                             (
                                 (width as i32 / 2) - (item_width / 2),
@@ -398,9 +408,201 @@ pub extern "C" fn efi_main(
                     Key::Printable(c) if u16::from(c) == '\r' as u16 => {
                         let selected = &menu_items[*idx];
                         match selected {
-                            MenuItem::Drive { name } => {
-                                crate::debug!("Selected drive: {}", name);
-                                break;
+                            MenuItem::Drive { name, handle } => {
+                                crate::info!("Booting from drive: {}", name);
+                                if let Some(h) = handle {
+                                    if let Ok(mut block_io) =
+                                        uefi::boot::open_protocol_exclusive::<BlockIO>(*h)
+                                    {
+                                        match fs::btrfs::Btrfs::new(&mut block_io) {
+                                            Ok(Some(mut btrfs)) => {
+                                                crate::info!("Btrfs detected. Searching for /Core/Boot/vmlinuz-linux...");
+
+                                                let res = (|| -> uefi::Result<()> {
+                                                    let fs_root = btrfs.get_fs_root()?;
+                                                    let root_dir_id = 256;
+
+                                                    let core_id = btrfs
+                                                        .find_file_in_dir(
+                                                            fs_root,
+                                                            root_dir_id,
+                                                            "Core",
+                                                        )?
+                                                        .ok_or(uefi::Error::new(
+                                                            uefi::Status::NOT_FOUND,
+                                                            (),
+                                                        ))?;
+
+                                                    let boot_id = btrfs
+                                                        .find_file_in_dir(fs_root, core_id, "Boot")?
+                                                        .ok_or(uefi::Error::new(
+                                                            uefi::Status::NOT_FOUND,
+                                                            (),
+                                                        ))?;
+
+                                                    let kernel_id = btrfs
+                                                        .find_file_in_dir(
+                                                            fs_root,
+                                                            boot_id,
+                                                            "vmlinuz-linux",
+                                                        )?
+                                                        .ok_or(uefi::Error::new(
+                                                            uefi::Status::NOT_FOUND,
+                                                            (),
+                                                        ))?;
+
+                                                    // Also try to find initramfs just to check existence
+                                                    let initrd_id = btrfs.find_file_in_dir(
+                                                        fs_root,
+                                                        boot_id,
+                                                        "initramfs-linux.img",
+                                                    )?;
+
+                                                    if let Some(initrd_inode) = initrd_id {
+                                                        crate::info!(
+                                                            "Found initramfs-linux.img, loading..."
+                                                        );
+                                                        let initrd_data = btrfs
+                                                            .read_file(fs_root, initrd_inode)?;
+                                                        crate::info!(
+                                                            "Initrd loaded ({} bytes).",
+                                                            initrd_data.len()
+                                                        );
+
+                                                        // Setup LoadFile2 for Initrd
+                                                        unsafe {
+                                                            INITRD_DATA = Some(initrd_data);
+
+                                                            // LINUX_EFI_INITRD_MEDIA_GUID
+                                                            // 5568e427-68fc-4f3d-ac74-ca555231cc68
+
+                                                            // Construct Device Path
+                                                            // Vendor Device Path (Type 4, SubType 3)
+                                                            // Header (4) + Guid (16) = 20 bytes
+                                                            // End (Type 0x7F, SubType 0xFF, Len 4)
+                                                            let device_path_data: [u8; 24] = [
+                                                                0x04, 0x03, 0x14,
+                                                                0x00, // Vendor Path Header
+                                                                0x27, 0xe4, 0x68, 0x55, 0xfc, 0x68,
+                                                                0x3d, 0x4f, // GUID Part 1
+                                                                0xac, 0x74, 0xca, 0x55, 0x52, 0x31,
+                                                                0xcc, 0x68, // GUID Part 2
+                                                                0x7f, 0xff, 0x04,
+                                                                0x00, // End Path
+                                                            ];
+
+                                                            // Install protocol
+                                                            #[repr(C)]
+                                                            struct EfiLoadFile2 {
+                                                                load_file: unsafe extern "efiapi" fn(
+                                                                    this: *mut core::ffi::c_void,
+                                                                    file_path: *const core::ffi::c_void,
+                                                                    boot_policy: bool,
+                                                                    buffer_size: *mut usize,
+                                                                    buffer: *mut u8,
+                                                                ) -> uefi::Status,
+                                                            }
+
+                                                            let load_file2 = EfiLoadFile2 {
+                                                                load_file: load_file2_initrd,
+                                                            };
+
+                                                            let load_file2_guid = uefi::proto::media::load_file::LoadFile2::GUID;
+                                                            let device_path_guid = uefi::proto::device_path::DevicePath::GUID;
+
+                                                            // Allocate DP on heap and leak it
+                                                            let dp_ptr = alloc::alloc::alloc(alloc::alloc::Layout::from_size_align(24, 4).unwrap());
+                                                            core::ptr::copy_nonoverlapping(
+                                                                device_path_data.as_ptr(),
+                                                                dp_ptr,
+                                                                24,
+                                                            );
+
+                                                            // Create a new handle with DevicePath first
+                                                            let new_handle = uefi::boot::install_protocol_interface(
+                                                                None,
+                                                                &device_path_guid,
+                                                                dp_ptr as *mut core::ffi::c_void
+                                                            )?;
+
+                                                            // Install LoadFile2 on that handle
+                                                            // Allocate protocol struct on heap and leak it
+                                                            let lf2_ptr = alloc::alloc::alloc(
+                                                                alloc::alloc::Layout::new::<
+                                                                    EfiLoadFile2,
+                                                                >(
+                                                                ),
+                                                            );
+                                                            core::ptr::write(
+                                                                lf2_ptr as *mut EfiLoadFile2,
+                                                                load_file2,
+                                                            );
+
+                                                            uefi::boot::install_protocol_interface(
+                                                                Some(new_handle),
+                                                                &load_file2_guid,
+                                                                lf2_ptr as *mut core::ffi::c_void,
+                                                            )?;
+
+                                                            crate::info!("Initrd LoadFile2 protocol installed.");
+                                                        }
+                                                    }
+
+                                                    crate::info!("Reading kernel...");
+                                                    let kernel_data =
+                                                        btrfs.read_file(fs_root, kernel_id)?;
+                                                    crate::info!(
+                                                        "Kernel loaded ({} bytes). Starting...",
+                                                        kernel_data.len()
+                                                    );
+
+                                                    let handle = uefi::boot::load_image(
+                                                        uefi::boot::image_handle(),
+                                                        uefi::boot::LoadImageSource::FromBuffer {
+                                                            buffer: &kernel_data,
+                                                            file_path: None,
+                                                        },
+                                                    )?;
+
+                                                    // Set Kernel Command Line
+                                                    let mut loaded_image =
+                                                        uefi::boot::open_protocol_exclusive::<
+                                                            LoadedImage,
+                                                        >(
+                                                            handle
+                                                        )?;
+
+                                                    // Command line: root=/dev/vda rw console=ttyS0
+                                                    let cmdline = "root=/dev/vda rw console=ttyS0";
+                                                    let mut cmdline_utf16: Vec<u16> =
+                                                        cmdline.encode_utf16().collect();
+                                                    cmdline_utf16.push(0); // Null terminate
+
+                                                    unsafe {
+                                                        loaded_image.set_load_options(
+                                                            cmdline_utf16.as_ptr() as *const u8,
+                                                            (cmdline_utf16.len() * 2) as u32,
+                                                        );
+                                                    }
+                                                    drop(loaded_image);
+
+                                                    uefi::boot::start_image(handle)?;
+                                                    Ok(())
+                                                })(
+                                                );
+
+                                                if let Err(e) = res {
+                                                    crate::error!("Boot failed: {:?}", e);
+                                                }
+                                            }
+                                            _ => {
+                                                crate::error!(
+                                                    "Not a Btrfs filesystem or read error"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             MenuItem::FirmwareSettings => {
                                 crate::debug!("Rebooting to firmware settings...");
@@ -468,6 +670,38 @@ pub extern "C" fn efi_main(
     uefi::Status::SUCCESS
 }
 
+static mut INITRD_DATA: Option<Vec<u8>> = None;
+
+unsafe extern "efiapi" fn load_file2_initrd(
+    _this: *mut core::ffi::c_void,
+    _file_path: *const core::ffi::c_void,
+    _boot_policy: bool,
+    buffer_size: *mut usize,
+    buffer: *mut u8,
+) -> uefi::Status {
+    if buffer_size.is_null() {
+        return uefi::Status::INVALID_PARAMETER;
+    }
+
+    let data = match unsafe { &*core::ptr::addr_of!(INITRD_DATA) } {
+        Some(d) => d,
+        None => return uefi::Status::NOT_FOUND,
+    };
+
+    let required_size = data.len();
+    let available_size = *buffer_size;
+
+    *buffer_size = required_size;
+
+    if buffer.is_null() || available_size < required_size {
+        return uefi::Status::BUFFER_TOO_SMALL;
+    }
+
+    core::ptr::copy_nonoverlapping(data.as_ptr(), buffer, required_size);
+    uefi::Status::SUCCESS
+}
+
+#[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
