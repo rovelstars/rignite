@@ -7,7 +7,6 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use uefi::boot::SearchType;
-use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
 use uefi::proto::console::text::{Key, ScanCode};
 use uefi::proto::media::block::BlockIO;
@@ -41,6 +40,9 @@ pub extern "C" fn efi_main(
         return uefi::Status::ABORTED;
     }
 
+    #[cfg(not(debug_assertions))]
+    log::set_max_level(log::LevelFilter::Info);
+
     log::info!("Rignite Bootloader Started");
 
     // Initialize Graphics
@@ -69,7 +71,7 @@ pub extern "C" fn efi_main(
     }
 
     let (width, height) = (display.width(), display.height());
-    log::info!("Resolution: {}x{}", width, height);
+    log::debug!("Resolution: {}x{}", width, height);
 
     // Load Resources
     let font_data = include_bytes!("../assets/font.data");
@@ -77,6 +79,7 @@ pub extern "C" fn efi_main(
     let firmware_icon_data = include_bytes!("../assets/firmware.raw");
     let reboot_icon_data = include_bytes!("../assets/reboot.raw");
     let shutdown_icon_data = include_bytes!("../assets/shutdown.raw");
+    let logo_icon_data = include_bytes!("../assets/logo.raw");
 
     // Init Renderers
     let font_renderer = FontRenderer::new(font_data);
@@ -84,6 +87,44 @@ pub extern "C" fn efi_main(
     let firmware_icon = Icon::new(firmware_icon_data, 512, 512);
     let reboot_icon = Icon::new(reboot_icon_data, 512, 512);
     let shutdown_icon = Icon::new(shutdown_icon_data, 512, 512);
+    let logo_icon = Icon::new(logo_icon_data, 512, 512);
+
+    // Logo Animation
+    display
+        .clear(Rgb888::new(0, 0, 0))
+        .expect("Failed to clear screen");
+
+    let logo_size = 64;
+    let center_x = (width as i32 / 2) - (logo_size as i32 / 2);
+    let center_y = (height as i32 / 2) - (logo_size as i32 / 2);
+
+    // Fade In
+    log::debug!("Starting logo fade-in...");
+    for i in 0..=60 {
+        display.clear(Rgb888::new(0, 0, 0)).ok();
+        let opacity = i as f32 / 60.0;
+        logo_icon.draw_scaled(&mut display, center_x, center_y, logo_size, opacity);
+        display.flush();
+        uefi::boot::stall(16_670);
+    }
+
+    uefi::boot::stall(2000_000); // Hold
+
+    // Fade Out
+    log::debug!("Starting logo fade-out...");
+    for i in (0..=60).rev() {
+        display.clear(Rgb888::new(0, 0, 0)).ok();
+        let opacity = i as f32 / 60.0;
+        logo_icon.draw_scaled(&mut display, center_x, center_y, logo_size, opacity);
+        display.flush();
+        uefi::boot::stall(16_670);
+    }
+
+    // Clear screen for menu
+    display
+        .clear(Rgb888::new(0, 0, 0))
+        .expect("Failed to clear screen");
+    display.flush();
 
     // Scan for Block Devices
     let handles = uefi::boot::locate_handle_buffer(SearchType::ByProtocol(&BlockIO::GUID))
@@ -132,18 +173,43 @@ pub extern "C" fn efi_main(
     let redraw = RefCell::new(true);
     let display = RefCell::new(display);
 
-    log::info!("Entering interactive loop...");
+    log::debug!("Entering interactive loop...");
 
     // Use with_stdin to access input safely
     uefi::system::with_stdin(|stdin| {
+        // Initialize scales for animation
+        let mut item_scales: Vec<f32> = Vec::new();
+        for _ in 0..menu_items.len() {
+            item_scales.push(1.0);
+        }
+
         let mut input_handler = InputHandler::new(stdin);
 
         loop {
+            // Update animations
+            let mut animating = false;
+            let selected = *selected_index.borrow();
+            for (i, scale) in item_scales.iter_mut().enumerate() {
+                let target = if i == selected { 1.2 } else { 1.0 };
+                let diff = target - *scale;
+                if diff.abs() > 0.01 {
+                    *scale += diff * 0.2; // Smooth transition
+                    animating = true;
+                } else {
+                    *scale = target;
+                }
+            }
+
+            if animating {
+                *redraw.borrow_mut() = true;
+            }
+
             if *redraw.borrow() {
-                log::info!("Redrawing UI...");
+                // log::debug!("Redrawing UI...");
                 let mut disp = display.borrow_mut();
 
-                // Don't clear on every redraw - it causes flicker
+                // Clear screen to avoid artifacts during animation
+                disp.clear(Rgb888::new(0, 0, 0)).ok();
 
                 // Dynamic sizing: 15% of screen height
                 let icon_size = (height as u32 * 15) / 100;
@@ -157,9 +223,10 @@ pub extern "C" fn efi_main(
 
                 // Layout: Drives in center, System options at bottom
                 let item_width = (icon_size * 2) as i32;
+                let is_vertical = height > width;
 
                 let title = "Select Boot Device";
-                log::info!("Drawing title at x={}, y={}", (width as i32 / 2) - 100, 100);
+                log::debug!("Drawing title at x={}, y={}", (width as i32 / 2) - 100, 100);
                 font_renderer.draw_text(
                     &mut *disp,
                     title,
@@ -169,7 +236,7 @@ pub extern "C" fn efi_main(
                     Rgb888::new(255, 255, 255),
                 );
 
-                log::info!(
+                log::debug!(
                     "Drawing {} total menu items, selected_index={}",
                     menu_items.len(),
                     *selected_index.borrow()
@@ -179,32 +246,46 @@ pub extern "C" fn efi_main(
                 let drives_start_x = (width as i32 / 2) - ((drive_count as i32 * item_width) / 2);
                 let drives_y = (height as i32 / 2) - (icon_size as i32 / 2);
 
+                // Vertical layout calculations
+                let vertical_item_height = icon_size as i32 + 60;
+                let drives_start_y_vertical =
+                    (height as i32 / 2) - ((drive_count as i32 * vertical_item_height) / 2);
+
                 let mut drive_idx = 0;
                 for (i, item) in menu_items.iter().enumerate() {
                     if let MenuItem::Drive { name } = item {
-                        let x = drives_start_x + (drive_idx as i32 * item_width);
-                        let y = drives_y;
+                        let (x, y) = if is_vertical {
+                            (
+                                (width as i32 / 2) - (item_width / 2),
+                                drives_start_y_vertical + (drive_idx as i32 * vertical_item_height),
+                            )
+                        } else {
+                            (drives_start_x + (drive_idx as i32 * item_width), drives_y)
+                        };
 
                         // Draw Icon
-                        drive_icon.draw_scaled(
-                            &mut *disp,
-                            x + (item_width - icon_size as i32) / 2,
-                            y,
-                            icon_size,
-                        );
+                        let scale = item_scales[i];
+                        let scaled_size = (icon_size as f32 * scale) as u32;
+
+                        let center_x = x + item_width / 2;
+                        let center_y = y + icon_size as i32 / 2;
+                        let draw_x = center_x - (scaled_size as i32 / 2);
+                        let draw_y = center_y - (scaled_size as i32 / 2);
+
+                        drive_icon.draw_scaled(&mut *disp, draw_x, draw_y, scaled_size, 1.0);
 
                         // Draw Text
                         let text_x = x + (item_width / 2) - (name.len() as i32 * 4);
                         let text_y = y + icon_size as i32 + 20;
 
                         let color = if i == *selected_index.borrow() {
-                            log::info!("Menu item {} '{}' is SELECTED (yellow)", i, name);
+                            log::debug!("Menu item {} '{}' is SELECTED (yellow)", i, name);
                             Rgb888::new(255, 255, 0)
                         } else {
                             Rgb888::new(200, 200, 200)
                         };
 
-                        log::info!(
+                        log::debug!(
                             "Drawing text '{}' at x={}, y={}, color=({},{},{})",
                             name,
                             text_x,
@@ -239,19 +320,22 @@ pub extern "C" fn efi_main(
                     let y = sys_options_y;
 
                     // Draw Icon (smaller)
-                    icon.draw_scaled(
-                        &mut *disp,
-                        x + (sys_item_width - sys_icon_size as i32) / 2,
-                        y,
-                        sys_icon_size,
-                    );
+                    let scale = item_scales[i];
+                    let scaled_size = (sys_icon_size as f32 * scale) as u32;
+
+                    let center_x = x + sys_item_width / 2;
+                    let center_y = y + sys_icon_size as i32 / 2;
+                    let draw_x = center_x - (scaled_size as i32 / 2);
+                    let draw_y = center_y - (scaled_size as i32 / 2);
+
+                    icon.draw_scaled(&mut *disp, draw_x, draw_y, scaled_size, 1.0);
 
                     // Draw Text (smaller font)
                     let text_x = x + (sys_item_width / 2) - (name.len() as i32 * 3);
                     let text_y = y + sys_icon_size as i32 + 15;
 
                     let color = if i == *selected_index.borrow() {
-                        log::info!("System option {} '{}' is SELECTED (yellow)", i, name);
+                        log::debug!("System option {} '{}' is SELECTED (yellow)", i, name);
                         Rgb888::new(255, 255, 0)
                     } else {
                         Rgb888::new(200, 200, 200)
@@ -261,8 +345,9 @@ pub extern "C" fn efi_main(
                     sys_idx += 1;
                 }
 
+                disp.flush();
                 *redraw.borrow_mut() = false;
-                log::info!("Redraw complete.");
+                log::debug!("Redraw complete.");
             }
 
             if let Some(key) = input_handler.read_key() {
@@ -300,11 +385,11 @@ pub extern "C" fn efi_main(
                         let selected = &menu_items[*idx];
                         match selected {
                             MenuItem::Drive { name } => {
-                                log::info!("Selected drive: {}", name);
+                                log::debug!("Selected drive: {}", name);
                                 break;
                             }
                             MenuItem::FirmwareSettings => {
-                                log::info!("Rebooting to firmware settings...");
+                                log::debug!("Rebooting to firmware settings...");
 
                                 // Set OsIndications variable to boot to firmware UI
                                 const EFI_OS_INDICATIONS_BOOT_TO_FW_UI: u64 = 0x0000000000000001;
@@ -326,7 +411,7 @@ pub extern "C" fn efi_main(
                                 match uefi::runtime::set_variable(var_name, &vendor, attrs, &value)
                                 {
                                     Ok(_) => {
-                                        log::info!("OsIndications variable set successfully");
+                                        log::debug!("OsIndications variable set successfully");
                                         uefi::runtime::reset(
                                             ResetType::COLD,
                                             uefi::Status::SUCCESS,
@@ -344,24 +429,16 @@ pub extern "C" fn efi_main(
                                 }
                             }
                             MenuItem::Reboot => {
-                                log::info!("Rebooting...");
-                                unsafe {
-                                    uefi::runtime::reset(
-                                        ResetType::COLD,
-                                        uefi::Status::SUCCESS,
-                                        None,
-                                    );
-                                }
+                                log::debug!("Rebooting...");
+                                uefi::runtime::reset(ResetType::COLD, uefi::Status::SUCCESS, None);
                             }
                             MenuItem::Shutdown => {
-                                log::info!("Shutting down...");
-                                unsafe {
-                                    uefi::runtime::reset(
-                                        ResetType::SHUTDOWN,
-                                        uefi::Status::SUCCESS,
-                                        None,
-                                    );
-                                }
+                                log::debug!("Shutting down...");
+                                uefi::runtime::reset(
+                                    ResetType::SHUTDOWN,
+                                    uefi::Status::SUCCESS,
+                                    None,
+                                );
                             }
                         }
                     }
@@ -369,8 +446,8 @@ pub extern "C" fn efi_main(
                 }
             }
 
-            // Stall to reduce CPU usage
-            uefi::boot::stall(10_000);
+            // Stall to reduce CPU usage and maintain approx 30 FPS
+            uefi::boot::stall(33_000);
         }
     });
 

@@ -28,7 +28,7 @@ impl<'a> FontRenderer<'a> {
         let mut glyph_count = 0;
         let mut pixel_count = 0;
 
-        log::info!("FontRenderer: drawing '{}' at ({},{}) scale={} color=({},{},{})", 
+        log::debug!("FontRenderer: drawing '{}' at ({},{}) scale={} color=({},{},{})", 
             text, x, y, scale_px, color.r(), color.g(), color.b());
 
         for c in text.chars() {
@@ -69,6 +69,6 @@ impl<'a> FontRenderer<'a> {
             caret.x += h_advance;
         }
         
-        log::info!("FontRenderer: drew {} glyphs, {} pixels total", glyph_count, pixel_count);
+        log::debug!("FontRenderer: drew {} glyphs, {} pixels total", glyph_count, pixel_count);
     }
 }

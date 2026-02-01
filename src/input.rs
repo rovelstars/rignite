@@ -1,4 +1,4 @@
-use uefi::proto::console::text::{Input, Key, ScanCode};
+use uefi::proto::console::text::{Input, Key};
 
 pub struct InputHandler<'a> {
     input: &'a mut Input,
