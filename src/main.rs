@@ -224,13 +224,17 @@ pub extern "C" fn efi_main(
                 let is_vertical = height > width;
 
                 let title = "Select Boot Device";
-                crate::debug!("Drawing title at x={}, y={}", (width as i32 / 2) - 100, 100);
+                let title_size = 28.0;
+                let title_width = font_renderer.get_text_width(title, title_size);
+                let title_x = (width as i32 - title_width) / 2;
+
+                crate::debug!("Drawing title at x={}, y={}", title_x, 100);
                 font_renderer.draw_text(
                     &mut *disp,
                     title,
-                    (width as i32 / 2) - 100,
+                    title_x,
                     100,
-                    32.0,
+                    title_size,
                     Rgb888::new(255, 255, 255),
                 );
 
@@ -273,7 +277,9 @@ pub extern "C" fn efi_main(
                         drive_icon.draw_scaled(&mut *disp, draw_x, draw_y, scaled_size, 1.0);
 
                         // Draw Text
-                        let text_x = x + (item_width / 2) - (name.len() as i32 * 4);
+                        let label_size = 18.0;
+                        let text_width = font_renderer.get_text_width(name, label_size);
+                        let text_x = x + (item_width / 2) - (text_width / 2);
                         let text_y = y + icon_size as i32 + 20;
 
                         let color = if i == *selected_index.borrow() {
@@ -292,7 +298,8 @@ pub extern "C" fn efi_main(
                             color.g(),
                             color.b()
                         );
-                        font_renderer.draw_text(&mut *disp, name, text_x, text_y, 20.0, color);
+                        font_renderer
+                            .draw_text(&mut *disp, name, text_x, text_y, label_size, color);
 
                         drive_idx += 1;
                     }
@@ -329,7 +336,9 @@ pub extern "C" fn efi_main(
                     icon.draw_scaled(&mut *disp, draw_x, draw_y, scaled_size, 1.0);
 
                     // Draw Text (smaller font)
-                    let text_x = x + (sys_item_width / 2) - (name.len() as i32 * 3);
+                    let sys_label_size = 14.0;
+                    let text_width = font_renderer.get_text_width(name, sys_label_size);
+                    let text_x = x + (sys_item_width / 2) - (text_width / 2);
                     let text_y = y + sys_icon_size as i32 + 15;
 
                     let color = if i == *selected_index.borrow() {
@@ -339,7 +348,14 @@ pub extern "C" fn efi_main(
                         Rgb888::new(200, 200, 200)
                     };
 
-                    font_renderer.draw_text(&mut *disp, name, text_x, text_y, 16.0, color); // Smaller font
+                    font_renderer.draw_text(
+                        &mut *disp,
+                        name,
+                        text_x,
+                        text_y,
+                        sys_label_size,
+                        color,
+                    ); // Smaller font
                     sys_idx += 1;
                 }
 

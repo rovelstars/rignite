@@ -141,9 +141,9 @@ def prepare_assets():
                 )
             except ImportError:
                 print("Error: PIL/Pillow not installed. Cannot convert to QOI.")
+            os.remove(png_path)
         else:
             print(f"Warning: PNG generation failed for {svg_name}")
-
 
 def build_uefi(arch="x86_64"):
     prepare_assets()

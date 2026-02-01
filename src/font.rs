@@ -15,6 +15,18 @@ impl FontRenderer {
         Self { font }
     }
 
+    pub fn get_text_width(&self, text: &str, scale_px: f32) -> i32 {
+        let mut width = 0.0;
+        for c in text.chars() {
+            if c.is_control() {
+                continue;
+            }
+            let metrics = self.font.metrics(c, scale_px);
+            width += metrics.advance_width;
+        }
+        width as i32
+    }
+
     pub fn draw_text(
         &self,
         display: &mut UefiDisplay,
