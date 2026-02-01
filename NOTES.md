@@ -34,3 +34,15 @@ Result:
 ```
 
 Our current EFI binary size is around **616KB** with the subsetted font!
+
+Update:
+```
+pyftsubset JBMR.ttf \
+    --unicodes="U+0020-007E" \
+    --no-hinting \
+    --desubroutinize \
+    --drop-tables+=DSIG,GPOS,GSUB,gasp,hdmx,LTSH,VDMX \
+    --output-file=JBMR_ultra.ttf
+```
+
+This reduced font size to just 12KB!

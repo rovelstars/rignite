@@ -68,7 +68,7 @@ impl<'a> UefiDisplay<'a> {
             .filter(|m| {
                 let (w, h) = m.info().resolution();
                 // Filter out excessive resolutions that might crash QEMU/VirtIO or exhaust ramfb
-                w <= 1280 && h <= 720
+                w <= 1920 && h <= 1200
             })
             .max_by_key(|m| {
                 let info = m.info();

@@ -86,47 +86,62 @@ else
     fi
 fi
 
-echo "Copying ROS Environment..."
-ROS_SRC="/home/ren/ROS"
-if [ -d "$ROS_SRC" ]; then
-    echo "Copying contents of $ROS_SRC to $MOUNT_DIR..."
-    cp -a "$ROS_SRC/." "$MOUNT_DIR/"
-    # Ensure root ownership for system files
-    chown -R root:root "$MOUNT_DIR"
-else
-    echo "WARNING: $ROS_SRC not found. Skipping copy."
-fi
+# echo "Copying ROS Environment..."
+# ROS_SRC="/home/ren/ROS"
+# if [ -d "$ROS_SRC" ]; then
+#     echo "Copying contents of $ROS_SRC to $MOUNT_DIR..."
+#     cp -a "$ROS_SRC/." "$MOUNT_DIR/"
+#     # Ensure root ownership for system files
+#     chown -R root:root "$MOUNT_DIR"
+# else
+#     echo "WARNING: $ROS_SRC not found. Skipping copy."
+# fi
 
 # Ensure standard directories exist if ROS didn't provide them
 mkdir -p "$MOUNT_DIR/Core/"{etc,usr,var,bin,sbin,lib64}
 mkdir -p "$MOUNT_DIR/Home/user"
 
-# Install bash and dependencies
-BASH_BIN=$(command -v bash)
-if [ -z "$BASH_BIN" ]; then
+install_binary() {
+    local bin_name=$1
+    local bin_path=$(command -v "$bin_name")
+
+    if [ -z "$bin_path" ]; then
+        echo "WARNING: $bin_name not found on host. Skipping."
+        return
+    fi
+
+    echo "Installing $bin_name from $bin_path..."
+    cp "$bin_path" "$MOUNT_DIR/Core/bin/$bin_name"
+
+    # Copy dependencies
+    ldd "$bin_path" | grep -o '/[^ ]*' | while read -r lib; do
+        # Determine destination dir inside Core, preserving path structure
+        # e.g. /usr/lib/libc.so.6 -> $MOUNT_DIR/Core/usr/lib/libc.so.6
+        dest_dir="$MOUNT_DIR/Core$(dirname "$lib")"
+        mkdir -p "$dest_dir"
+        cp "$lib" "$dest_dir/"
+    done
+}
+
+# Install bash (required)
+if ! command -v bash >/dev/null; then
     echo "Error: bash not found on host."
     exit 1
 fi
+install_binary bash
 
-echo "Installing bash from $BASH_BIN..."
-cp "$BASH_BIN" "$MOUNT_DIR/Core/bin/bash"
-
-# Copy dependencies
-echo "Copying bash dependencies..."
-ldd "$BASH_BIN" | grep -o '/[^ ]*' | while read -r lib; do
-    # Determine destination dir inside Core, preserving path structure
-    # e.g. /usr/lib/libc.so.6 -> $MOUNT_DIR/Core/usr/lib/libc.so.6
-    dest_dir="$MOUNT_DIR/Core$(dirname "$lib")"
-    mkdir -p "$dest_dir"
-    cp "$lib" "$dest_dir/"
-done
+# Install busybox and binutils (temporarily)
+install_binary busybox
+install_binary ld
+install_binary as
+install_binary objdump
 
 # Create the init script
 echo "Creating bash init script..."
 cat <<EOF > "$MOUNT_DIR/Core/sbin/init"
 #!/bin/bash
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/Core/Bin
-echo "Successfully booted into RigniteOS (Bash Mode)!"
+echo "Successfully booted into RunixOS (Bash Mode)!"
 echo "Dropping to shell..."
 exec /bin/bash --login
 EOF

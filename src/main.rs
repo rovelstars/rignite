@@ -84,10 +84,10 @@ pub extern "C" fn efi_main(
 
     // Init Renderers
     let font_renderer = FontRenderer::new(font_data);
-    let drive_icon = Icon::new(drive_icon_data, 512, 512);
-    let firmware_icon = Icon::new(firmware_icon_data, 512, 512);
-    let reboot_icon = Icon::new(reboot_icon_data, 512, 512);
-    let shutdown_icon = Icon::new(shutdown_icon_data, 512, 512);
+    let drive_icon = Icon::new(drive_icon_data, 196, 196);
+    let firmware_icon = Icon::new(firmware_icon_data, 32, 32);
+    let reboot_icon = Icon::new(reboot_icon_data, 32, 32);
+    let shutdown_icon = Icon::new(shutdown_icon_data, 32, 32);
     let logo_icon = logo::Logo::new();
 
     // Scan for Block Devices
@@ -475,7 +475,7 @@ pub extern "C" fn efi_main(
                 }
 
                 // Draw system options at bottom (smaller than drives)
-                let sys_icon_size = (icon_size * 6) / 10; // 60% of drive icon size
+                let sys_icon_size = (icon_size * 3) / 10; // 30% of drive icon size
                 let sys_options_y = height as i32 - sys_icon_size as i32 - 80;
                 let sys_option_count = 3; // Firmware, Reboot, Shutdown
                 let sys_item_width = (sys_icon_size * 2) as i32;
@@ -484,7 +484,7 @@ pub extern "C" fn efi_main(
                 let mut sys_idx = 0;
                 for (i, item) in menu_items.iter().enumerate() {
                     let (icon, name) = match item {
-                        MenuItem::FirmwareSettings => (&firmware_icon, "Firmware Settings"),
+                        MenuItem::FirmwareSettings => (&firmware_icon, "FW"),
                         MenuItem::Reboot => (&reboot_icon, "Reboot"),
                         MenuItem::Shutdown => (&shutdown_icon, "Shutdown"),
                         MenuItem::Drive { .. } => continue,

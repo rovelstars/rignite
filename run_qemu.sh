@@ -16,7 +16,7 @@ if [ "$ARCH" == "x86_64" ]; then
         -drive file=disk.img,if=none,id=drive0,format=raw \
         -device virtio-blk-pci,drive=drive0 \
         -vga std \
-        -device qemu-xhci -device usb-tablet \
+        -device qemu-xhci -device usb-tablet -device usb-kbd \
         -display gtk,gl=on -serial stdio \
         -boot menu=on,splash-time=0
 elif [ "$ARCH" == "aarch64" ]; then
@@ -31,7 +31,7 @@ qemu-system-aarch64 \
     -drive file=disk.img,if=none,id=drive0,format=raw \
     -device virtio-blk-pci,drive=drive0 \
     -vga none -device ramfb \
-    -device qemu-xhci -device usb-tablet \
+    -device qemu-xhci -device usb-tablet -device usb-kbd \
     -display gtk,gl=on -serial stdio \
     -boot menu=on,splash-time=0
 else

@@ -1,0 +1,48 @@
+name: Release UEFI Binaries
+
+on:
+  release:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Publish UEFI Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y librsvg2-bin
+
+      - name: Install Python dependencies
+        run: pip install Pillow
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-uefi, aarch64-unknown-uefi
+
+      - name: Build UEFI (x86_64)
+        run: python build.py x86_64
+
+      - name: Build UEFI (aarch64)
+        run: python build.py aarch64
+
+      - name: Upload Release Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} \
+            target/uefi/esp/EFI/BOOT/BOOTX64.EFI \
+            target/uefi/esp/EFI/BOOT/BOOTAA64.EFI

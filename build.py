@@ -85,7 +85,7 @@ def prepare_assets():
 
     # 1. Process Font
     # Just copy the TTF for inclusion
-    ttf_src = os.path.join(MEDIA_DIR, "JBMR_subset.ttf")
+    ttf_src = os.path.join(MEDIA_DIR, "JBMR_ultra.ttf")
     if os.path.exists(ttf_src):
         shutil.copy(ttf_src, os.path.join(ASSETS_DIR, "font.data"))
     else:
@@ -93,13 +93,13 @@ def prepare_assets():
 
     # 2. Process Icons (multiple icons now)
     icons = [
-        ("drive-harddisk-root.svg", "drive.qoi"),
-        ("firmware.svg", "firmware.qoi"),
-        ("reboot.svg", "reboot.qoi"),
-        ("shutdown.svg", "shutdown.qoi"),
+        ("drive-harddisk-root.svg", "drive.qoi", 196),
+        ("firmware.svg", "firmware.qoi", 32),
+        ("reboot.svg", "reboot.qoi", 32),
+        ("shutdown.svg", "shutdown.qoi", 32),
     ]
 
-    for svg_name, raw_name in icons:
+    for svg_name, raw_name, pixel_size in icons:
         svg_src = os.path.join(MEDIA_DIR, svg_name)
         raw_dst = os.path.join(ASSETS_DIR, raw_name)
 
@@ -110,8 +110,8 @@ def prepare_assets():
         png_path = os.path.join(ASSETS_DIR, "temp.png")
 
         try:
-            # Try rsvg-convert for 512x512 (ultra high quality)
-            run_command(f"rsvg-convert -w 512 -h 512 -f png -o {png_path} {svg_src}")
+            # Try rsvg-convert
+            run_command(f"rsvg-convert -w {pixel_size} -h {pixel_size} -f png -o {png_path} {svg_src}")
         except subprocess.CalledProcessError:
             try:
                 # Try convert
