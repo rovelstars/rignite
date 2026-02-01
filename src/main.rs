@@ -18,6 +18,7 @@ mod font;
 mod graphics;
 mod icons;
 mod input;
+mod logger;
 
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::RgbColor;
@@ -40,16 +41,13 @@ pub extern "C" fn efi_main(
         return uefi::Status::ABORTED;
     }
 
-    #[cfg(not(debug_assertions))]
-    log::set_max_level(log::LevelFilter::Info);
-
-    log::info!("Rignite Bootloader Started");
+    crate::info!("Rignite Bootloader Started");
 
     // Initialize Graphics
     let gop_handle = match uefi::boot::get_handle_for_protocol::<GraphicsOutput>() {
         Ok(h) => h,
         Err(e) => {
-            log::error!("Failed to get GOP handle: {:?}", e);
+            crate::error!("Failed to get GOP handle: {:?}", e);
             return e.status();
         }
     };
@@ -57,7 +55,7 @@ pub extern "C" fn efi_main(
     let mut gop = match uefi::boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle) {
         Ok(g) => g,
         Err(e) => {
-            log::error!("Failed to open GOP: {:?}", e);
+            crate::error!("Failed to open GOP: {:?}", e);
             return e.status();
         }
     };
@@ -67,11 +65,11 @@ pub extern "C" fn efi_main(
 
     // High Resolution
     if let Err(e) = display.set_highest_resolution() {
-        log::warn!("Failed to set resolution: {:?}", e);
+        crate::warn!("Failed to set resolution: {:?}", e);
     }
 
     let (width, height) = (display.width(), display.height());
-    log::debug!("Resolution: {}x{}", width, height);
+    crate::info!("Resolution: {}x{}", width, height);
 
     // Load Resources
     let font_data = include_bytes!("../assets/font.data");
@@ -99,7 +97,7 @@ pub extern "C" fn efi_main(
     let center_y = (height as i32 / 2) - (logo_size as i32 / 2);
 
     // Fade In
-    log::debug!("Starting logo fade-in...");
+    crate::debug!("Starting logo fade-in...");
     for i in 0..=60 {
         display.clear(Rgb888::new(0, 0, 0)).ok();
         let opacity = i as f32 / 60.0;
@@ -111,7 +109,7 @@ pub extern "C" fn efi_main(
     uefi::boot::stall(2000_000); // Hold
 
     // Fade Out
-    log::debug!("Starting logo fade-out...");
+    crate::debug!("Starting logo fade-out...");
     for i in (0..=60).rev() {
         display.clear(Rgb888::new(0, 0, 0)).ok();
         let opacity = i as f32 / 60.0;
@@ -173,7 +171,7 @@ pub extern "C" fn efi_main(
     let redraw = RefCell::new(true);
     let display = RefCell::new(display);
 
-    log::debug!("Entering interactive loop...");
+    crate::info!("Entering interactive loop...");
 
     // Use with_stdin to access input safely
     uefi::system::with_stdin(|stdin| {
@@ -205,7 +203,7 @@ pub extern "C" fn efi_main(
             }
 
             if *redraw.borrow() {
-                // log::debug!("Redrawing UI...");
+                // crate::debug!("Redrawing UI...");
                 let mut disp = display.borrow_mut();
 
                 // Clear screen to avoid artifacts during animation
@@ -226,7 +224,7 @@ pub extern "C" fn efi_main(
                 let is_vertical = height > width;
 
                 let title = "Select Boot Device";
-                log::debug!("Drawing title at x={}, y={}", (width as i32 / 2) - 100, 100);
+                crate::debug!("Drawing title at x={}, y={}", (width as i32 / 2) - 100, 100);
                 font_renderer.draw_text(
                     &mut *disp,
                     title,
@@ -236,7 +234,7 @@ pub extern "C" fn efi_main(
                     Rgb888::new(255, 255, 255),
                 );
 
-                log::debug!(
+                crate::debug!(
                     "Drawing {} total menu items, selected_index={}",
                     menu_items.len(),
                     *selected_index.borrow()
@@ -279,13 +277,13 @@ pub extern "C" fn efi_main(
                         let text_y = y + icon_size as i32 + 20;
 
                         let color = if i == *selected_index.borrow() {
-                            log::debug!("Menu item {} '{}' is SELECTED (yellow)", i, name);
+                            crate::debug!("Menu item {} '{}' is SELECTED (yellow)", i, name);
                             Rgb888::new(255, 255, 0)
                         } else {
                             Rgb888::new(200, 200, 200)
                         };
 
-                        log::debug!(
+                        crate::debug!(
                             "Drawing text '{}' at x={}, y={}, color=({},{},{})",
                             name,
                             text_x,
@@ -335,7 +333,7 @@ pub extern "C" fn efi_main(
                     let text_y = y + sys_icon_size as i32 + 15;
 
                     let color = if i == *selected_index.borrow() {
-                        log::debug!("System option {} '{}' is SELECTED (yellow)", i, name);
+                        crate::debug!("System option {} '{}' is SELECTED (yellow)", i, name);
                         Rgb888::new(255, 255, 0)
                     } else {
                         Rgb888::new(200, 200, 200)
@@ -347,7 +345,7 @@ pub extern "C" fn efi_main(
 
                 disp.flush();
                 *redraw.borrow_mut() = false;
-                log::debug!("Redraw complete.");
+                crate::debug!("Redraw complete.");
             }
 
             if let Some(key) = input_handler.read_key() {
@@ -385,11 +383,11 @@ pub extern "C" fn efi_main(
                         let selected = &menu_items[*idx];
                         match selected {
                             MenuItem::Drive { name } => {
-                                log::debug!("Selected drive: {}", name);
+                                crate::debug!("Selected drive: {}", name);
                                 break;
                             }
                             MenuItem::FirmwareSettings => {
-                                log::debug!("Rebooting to firmware settings...");
+                                crate::debug!("Rebooting to firmware settings...");
 
                                 // Set OsIndications variable to boot to firmware UI
                                 const EFI_OS_INDICATIONS_BOOT_TO_FW_UI: u64 = 0x0000000000000001;
@@ -411,7 +409,7 @@ pub extern "C" fn efi_main(
                                 match uefi::runtime::set_variable(var_name, &vendor, attrs, &value)
                                 {
                                     Ok(_) => {
-                                        log::debug!("OsIndications variable set successfully");
+                                        crate::debug!("OsIndications variable set successfully");
                                         uefi::runtime::reset(
                                             ResetType::COLD,
                                             uefi::Status::SUCCESS,
@@ -419,7 +417,7 @@ pub extern "C" fn efi_main(
                                         );
                                     }
                                     Err(e) => {
-                                        log::warn!("Failed to set OsIndications: {:?}, doing normal reboot", e);
+                                        crate::warn!("Failed to set OsIndications: {:?}, doing normal reboot", e);
                                         uefi::runtime::reset(
                                             ResetType::COLD,
                                             uefi::Status::SUCCESS,
@@ -429,11 +427,11 @@ pub extern "C" fn efi_main(
                                 }
                             }
                             MenuItem::Reboot => {
-                                log::debug!("Rebooting...");
+                                crate::debug!("Rebooting...");
                                 uefi::runtime::reset(ResetType::COLD, uefi::Status::SUCCESS, None);
                             }
                             MenuItem::Shutdown => {
-                                log::debug!("Shutting down...");
+                                crate::debug!("Shutting down...");
                                 uefi::runtime::reset(
                                     ResetType::SHUTDOWN,
                                     uefi::Status::SUCCESS,

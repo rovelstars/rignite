@@ -85,7 +85,7 @@ def prepare_assets():
 
     # 1. Process Font
     # Just copy the TTF for inclusion
-    ttf_src = os.path.join(MEDIA_DIR, "JetBrainsMono-Regular.ttf")
+    ttf_src = os.path.join(MEDIA_DIR, "JBMR_subset.ttf")
     if os.path.exists(ttf_src):
         shutil.copy(ttf_src, os.path.join(ASSETS_DIR, "font.data"))
     else:

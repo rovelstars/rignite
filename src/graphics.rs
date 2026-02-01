@@ -61,7 +61,7 @@ impl<'a> UefiDisplay<'a> {
     }
 
     pub fn set_highest_resolution(&mut self) -> uefi::Result {
-        log::info!("Querying video modes...");
+        crate::info!("Querying video modes...");
         let mode = self
             .gop
             .modes()
@@ -73,23 +73,23 @@ impl<'a> UefiDisplay<'a> {
             .max_by_key(|m| {
                 let info = m.info();
                 let (w, h) = info.resolution();
-                log::info!("Found mode: {}x{}", w, h);
+                crate::info!("Found mode: {}x{}", w, h);
                 w * h
             });
 
         if let Some(mode) = mode {
             let info = mode.info();
             let (w, h) = info.resolution();
-            log::info!("Setting mode: {}x{}", w, h);
+            crate::info!("Setting mode: {}x{}", w, h);
             self.gop.set_mode(&mode)?;
             let info = self.gop.current_mode_info();
             let (_, height) = info.resolution();
             let stride = info.stride();
             let len = (height * stride * 4) as usize;
             self.backbuffer = vec![0; len];
-            log::info!("Mode set successfully. Format: {:?}", info.pixel_format());
+            crate::info!("Mode set successfully. Format: {:?}", info.pixel_format());
         } else {
-            log::warn!("No video modes found or all filtered out.");
+            crate::warn!("No video modes found or all filtered out.");
         }
         Ok(())
     }
