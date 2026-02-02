@@ -1,0 +1,5 @@
+# gradle based vanilla android app related files
+
+.gradle/
+local_jdk
+app/build/

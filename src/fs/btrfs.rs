@@ -289,13 +289,17 @@ pub struct Btrfs<'a> {
 
 impl<'a> Btrfs<'a> {
     pub fn new(block_io: &'a mut BlockIO) -> Result<Option<Self>> {
-        let mut buffer = vec![0u8; 4096]; // Superblock is 4096 bytes
+        // Allocate aligned buffer (4096 bytes)
+        // Some UEFI implementations (and QEMU virtio) require IO buffers to be aligned.
+        let mut raw_buffer = vec![0u8; 4096 + 4096];
+        let align_offset = raw_buffer.as_ptr().align_offset(4096);
+        let buffer = &mut raw_buffer[align_offset..align_offset + 4096];
 
         // Read Superblock at 64KB
         block_io.read_blocks(
             block_io.media().media_id(),
             BTRFS_SUPER_INFO_OFFSET / block_io.media().block_size() as u64,
-            &mut buffer,
+            buffer,
         )?;
 
         let sb = unsafe {
@@ -304,6 +308,13 @@ impl<'a> Btrfs<'a> {
         };
 
         if &sb.magic != BTRFS_SIGNATURE {
+            if sb.magic != [0; 8] {
+                crate::warn!(
+                    "Btrfs: Invalid magic bytes at 64KB offset: {:02x?}. Expected: {:02x?}",
+                    &sb.magic,
+                    BTRFS_SIGNATURE
+                );
+            }
             return Ok(None);
         }
 

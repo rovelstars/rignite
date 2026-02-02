@@ -16,6 +16,7 @@ use uefi::runtime::{ResetType, VariableAttributes, VariableVendor};
 use uefi::CStr16;
 use uefi::Identify;
 
+mod boot;
 mod font;
 mod fs;
 mod graphics;
@@ -23,6 +24,7 @@ mod icons;
 mod input;
 mod logger;
 mod logo;
+mod rdf;
 
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::RgbColor;
@@ -44,6 +46,8 @@ pub extern "C" fn efi_main(
     if let Err(_) = uefi::helpers::init() {
         return uefi::Status::ABORTED;
     }
+
+    logger::init();
 
     crate::info!("Rignite Bootloader Started");
 
@@ -103,6 +107,7 @@ pub extern "C" fn efi_main(
         FirmwareSettings,
         Reboot,
         Shutdown,
+        Recovery,
     }
 
     let mut menu_items = Vec::new();
@@ -111,38 +116,52 @@ pub extern "C" fn efi_main(
     // Add drives
     for handle in handles.iter() {
         if let Ok(mut block_io) = uefi::boot::open_protocol_exclusive::<BlockIO>(*handle) {
-            let (is_present, size_gb, is_removable) = {
+            let (is_present, size_bytes, is_removable) = {
                 let media = block_io.media();
                 (
                     media.is_media_present(),
-                    media.block_size() as u64 * media.last_block() / (1024 * 1024 * 1024),
+                    (media.block_size() as u64).saturating_mul(media.last_block() + 1),
                     media.is_removable_media(),
                 )
             };
-            // empty drives are skipped
-            if size_gb == 0 {
+
+            // Skip extremely small drives (e.g. < 1MB) to filter noise
+            if size_bytes < 1024 * 1024 {
                 continue;
             }
+
+            let size_str = if size_bytes >= 1024 * 1024 * 1024 {
+                format!("{}GB", size_bytes / (1024 * 1024 * 1024))
+            } else {
+                format!("{}MB", size_bytes / (1024 * 1024))
+            };
+
             if is_present {
                 let mut label_name = None;
 
                 // Try to read Btrfs label
-                if let Ok(Some(btrfs)) = fs::btrfs::Btrfs::new(&mut block_io) {
-                    let label = btrfs.get_label();
-                    if !label.is_empty() {
-                        label_name = Some(format!("{} ({}GB)", label, size_gb));
-                        if label == "RunixOS" {
-                            runixos_handle = Some(*handle);
+                match fs::btrfs::Btrfs::new(&mut block_io) {
+                    Ok(Some(btrfs)) => {
+                        let label = btrfs.get_label();
+                        if !label.is_empty() {
+                            label_name = Some(format!("{} ({})", label, size_str));
+                            if label == "RunixOS" {
+                                runixos_handle = Some(*handle);
+                            }
                         }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        crate::warn!("Btrfs probe failed on handle {:?}: {:?}", handle, e);
                     }
                 }
 
                 let name = if let Some(l) = label_name {
                     l
                 } else if is_removable {
-                    format!("Removable {}GB", size_gb)
+                    format!("Removable {}", size_str)
                 } else {
-                    format!("HDD {}GB", size_gb)
+                    format!("HDD {}", size_str)
                 };
 
                 menu_items.push(MenuItem::Drive {
@@ -164,6 +183,7 @@ pub extern "C" fn efi_main(
     menu_items.push(MenuItem::FirmwareSettings);
     menu_items.push(MenuItem::Reboot);
     menu_items.push(MenuItem::Shutdown);
+    menu_items.push(MenuItem::Recovery);
 
     use core::cell::RefCell;
     let display = RefCell::new(display);
@@ -305,7 +325,7 @@ pub extern "C" fn efi_main(
         if !enter_menu {
             if let Some(handle) = runixos_handle {
                 crate::info!("Auto-booting RunixOS...");
-                if let Err(e) = boot_linux_from_drive(handle) {
+                if let Err(e) = boot::boot_linux_from_drive(handle) {
                     crate::error!("Failed to auto-boot: {:?}", e);
                     enter_menu = true;
                 } else {
@@ -355,9 +375,8 @@ pub extern "C" fn efi_main(
         loop {
             // Update animations
             let mut animating = false;
-            let selected = *selected_index.borrow();
-            for (i, scale) in item_scales.iter_mut().enumerate() {
-                let target = if i == selected { 1.2 } else { 1.0 };
+            for (_, scale) in item_scales.iter_mut().enumerate() {
+                let target = 1.0;
                 let diff = target - *scale;
                 if diff.abs() > 0.01 {
                     *scale += diff * 0.2; // Smooth transition
@@ -477,7 +496,7 @@ pub extern "C" fn efi_main(
                 // Draw system options at bottom (smaller than drives)
                 let sys_icon_size = (icon_size * 3) / 10; // 30% of drive icon size
                 let sys_options_y = height as i32 - sys_icon_size as i32 - 80;
-                let sys_option_count = 3; // Firmware, Reboot, Shutdown
+                let sys_option_count = 4; // Firmware, Reboot, Shutdown, Recovery (RFU)
                 let sys_item_width = (sys_icon_size * 2) as i32;
                 let sys_start_x = (width as i32 / 2) - ((sys_option_count * sys_item_width) / 2);
 
@@ -487,6 +506,7 @@ pub extern "C" fn efi_main(
                         MenuItem::FirmwareSettings => (&firmware_icon, "FW"),
                         MenuItem::Reboot => (&reboot_icon, "Reboot"),
                         MenuItem::Shutdown => (&shutdown_icon, "Shutdown"),
+                        MenuItem::Recovery => (&firmware_icon, "RFU"),
                         MenuItem::Drive { .. } => continue,
                     };
 
@@ -570,7 +590,7 @@ pub extern "C" fn efi_main(
                             MenuItem::Drive { name, handle } => {
                                 crate::info!("Booting from drive: {}", name);
                                 if let Some(h) = handle {
-                                    if let Err(e) = boot_linux_from_drive(*h) {
+                                    if let Err(e) = boot::boot_linux_from_drive(*h) {
                                         crate::error!("Boot failed: {:?}", e);
                                     }
                                 }
@@ -627,6 +647,257 @@ pub extern "C" fn efi_main(
                                     None,
                                 );
                             }
+                            MenuItem::Recovery => {
+                                crate::info!("Entering Recovery Mode...");
+                                let mut recovery_selected_idx = 0;
+                                let mut devices = Vec::new();
+                                let mut scan_counter = 10; // Force initial scan
+
+                                loop {
+                                    // Poll devices every 1s (10 * 100ms)
+                                    if scan_counter >= 10 {
+                                        scan_counter = 0;
+                                        match rdf::RdfManager::list_devices() {
+                                            Ok(d) => devices = d,
+                                            Err(e) => {
+                                                crate::warn!("Error listing devices: {:?}", e);
+                                            }
+                                        };
+                                    }
+                                    scan_counter += 1;
+
+                                    let mut disp = display.borrow_mut();
+                                    disp.clear(Rgb888::new(0, 0, 0)).ok();
+                                    font_renderer.draw_text(
+                                        &mut *disp,
+                                        "Recovery Mode - Select Device:",
+                                        20,
+                                        20,
+                                        20.0,
+                                        Rgb888::new(255, 255, 255),
+                                    );
+
+                                    // Draw Debug Console (Last 10 lines)
+                                    let logs = logger::get_logs();
+                                    for (i, entry) in logs.iter().rev().take(10).enumerate() {
+                                        let color = match entry.level {
+                                            "ERR" => Rgb888::new(255, 100, 100),
+                                            "WRN" => Rgb888::new(255, 255, 0),
+                                            "DBG" => Rgb888::new(100, 100, 100),
+                                            _ => Rgb888::new(200, 200, 200),
+                                        };
+                                        // Draw from bottom up
+                                        font_renderer.draw_text(
+                                            &mut *disp,
+                                            &format!("[{}] {}", entry.level, entry.message),
+                                            20,
+                                            height as i32 - 20 - (i as i32 * 16),
+                                            14.0,
+                                            color,
+                                        );
+                                    }
+
+                                    if devices.is_empty() {
+                                        font_renderer.draw_text(
+                                            &mut *disp,
+                                            "No USB IO devices found.",
+                                            20,
+                                            60,
+                                            16.0,
+                                            Rgb888::new(200, 200, 200),
+                                        );
+                                    } else {
+                                        if recovery_selected_idx >= devices.len() {
+                                            recovery_selected_idx = 0;
+                                        }
+
+                                        for (i, dev) in devices.iter().enumerate() {
+                                            let is_selected = i == recovery_selected_idx;
+                                            let prefix = if is_selected { "> " } else { "  " };
+                                            let info = format!(
+                                                "{}VID: {:#06x} PID: {:#06x}",
+                                                prefix, dev.vid, dev.pid
+                                            );
+
+                                            let color = if is_selected {
+                                                Rgb888::new(255, 255, 0)
+                                            } else {
+                                                Rgb888::new(200, 255, 200)
+                                            };
+
+                                            font_renderer.draw_text(
+                                                &mut *disp,
+                                                &info,
+                                                20,
+                                                60 + (i as i32 * 20),
+                                                16.0,
+                                                color,
+                                            );
+                                        }
+                                    }
+
+                                    font_renderer.draw_text(
+                                        &mut *disp,
+                                        "Press ENTER to flash, ESC to return...",
+                                        20,
+                                        height as i32 - 200,
+                                        16.0,
+                                        Rgb888::new(150, 150, 150),
+                                    );
+
+                                    disp.flush();
+                                    uefi::boot::stall(100_000); // 100ms
+
+                                    if let Some(key) = input_handler.read_key() {
+                                        match key {
+                                            Key::Special(ScanCode::ESCAPE) => break,
+                                            Key::Special(ScanCode::UP) => {
+                                                if recovery_selected_idx > 0 {
+                                                    recovery_selected_idx -= 1;
+                                                }
+                                            }
+                                            Key::Special(ScanCode::DOWN) => {
+                                                if !devices.is_empty()
+                                                    && recovery_selected_idx < devices.len() - 1
+                                                {
+                                                    recovery_selected_idx += 1;
+                                                }
+                                            }
+                                            Key::Printable(c) if u16::from(c) == '\r' as u16 => {
+                                                if !devices.is_empty() {
+                                                    let dev = &devices[recovery_selected_idx];
+
+                                                    // Drop display lock to allow callback to use it
+                                                    drop(disp);
+
+                                                    let res = rdf::RdfManager::download_image(
+                                                        dev,
+                                                        |curr, total| {
+                                                            let mut d = display.borrow_mut();
+                                                            d.clear(Rgb888::new(0, 0, 20)).ok();
+
+                                                            let progress = if total > 0 {
+                                                                (curr as f32 / total as f32 * 100.0)
+                                                                    as u32
+                                                            } else {
+                                                                0
+                                                            };
+
+                                                            font_renderer.draw_text(
+                                                                &mut *d,
+                                                                "Flashing in progress...",
+                                                                20,
+                                                                20,
+                                                                20.0,
+                                                                Rgb888::new(255, 255, 255),
+                                                            );
+
+                                                            let status = format!(
+                                                                "Received: {} / {} bytes",
+                                                                curr, total
+                                                            );
+                                                            font_renderer.draw_text(
+                                                                &mut *d,
+                                                                &status,
+                                                                20,
+                                                                60,
+                                                                16.0,
+                                                                Rgb888::new(200, 200, 200),
+                                                            );
+
+                                                            // Draw simple bar
+                                                            let filled_len =
+                                                                (progress as usize / 5).min(20);
+                                                            let empty_len = 20 - filled_len;
+                                                            let mut bar_str = String::from("[");
+                                                            for _ in 0..filled_len {
+                                                                bar_str.push('=');
+                                                            }
+                                                            for _ in 0..empty_len {
+                                                                bar_str.push(' ');
+                                                            }
+                                                            bar_str.push(']');
+                                                            let bar_display = format!(
+                                                                "{} {}%",
+                                                                bar_str, progress
+                                                            );
+
+                                                            font_renderer.draw_text(
+                                                                &mut *d,
+                                                                &bar_display,
+                                                                20,
+                                                                100,
+                                                                16.0,
+                                                                Rgb888::new(0, 255, 0),
+                                                            );
+                                                            d.flush();
+                                                        },
+                                                    );
+
+                                                    match res {
+                                                        Ok(downloaded_image) => {
+                                                            crate::info!("Flashing Complete!");
+                                                            uefi::boot::stall(1_000_000);
+
+                                                            crate::info!(
+                                                                "Attempting to boot from RAM..."
+                                                            );
+                                                            let cmdline = "console=ttyS0";
+                                                            // Note: boot_from_memory might not return if successful
+                                                            if let Err(e) = boot::boot_from_memory(
+                                                                &downloaded_image,
+                                                                None,
+                                                                cmdline,
+                                                            ) {
+                                                                crate::error!(
+                                                                    "RAM Boot failed: {:?}",
+                                                                    e
+                                                                );
+                                                                // Need to re-borrow display to show error
+                                                                let mut d = display.borrow_mut();
+                                                                let err_msg =
+                                                                    format!("Boot Error: {:?}", e);
+                                                                font_renderer.draw_text(
+                                                                    &mut *d,
+                                                                    &err_msg,
+                                                                    20,
+                                                                    140,
+                                                                    16.0,
+                                                                    Rgb888::new(255, 0, 0),
+                                                                );
+                                                                d.flush();
+                                                                uefi::boot::stall(5_000_000);
+                                                            }
+                                                            break;
+                                                        }
+                                                        Err(e) => {
+                                                            crate::error!(
+                                                                "Download failed: {:?}",
+                                                                e
+                                                            );
+                                                            let mut d = display.borrow_mut();
+                                                            let err_msg =
+                                                                format!("Download Error: {:?}", e);
+                                                            font_renderer.draw_text(
+                                                                &mut *d,
+                                                                &err_msg,
+                                                                20,
+                                                                140,
+                                                                16.0,
+                                                                Rgb888::new(255, 0, 0),
+                                                            );
+                                                            d.flush();
+                                                            uefi::boot::stall(3_000_000);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                *redraw.borrow_mut() = true;
+                            }
                         }
                     }
                     _ => {}
@@ -638,181 +909,6 @@ pub extern "C" fn efi_main(
         }
     });
 
-    uefi::Status::SUCCESS
-}
-
-#[repr(C)]
-struct EfiLoadFile2 {
-    load_file: unsafe extern "efiapi" fn(
-        this: *mut core::ffi::c_void,
-        file_path: *const core::ffi::c_void,
-        boot_policy: bool,
-        buffer_size: *mut usize,
-        buffer: *mut u8,
-    ) -> uefi::Status,
-}
-
-fn boot_linux_from_drive(handle: uefi::Handle) -> uefi::Result<()> {
-    let mut block_io = uefi::boot::open_protocol_exclusive::<BlockIO>(handle)?;
-
-    let mut btrfs = match fs::btrfs::Btrfs::new(&mut block_io)? {
-        Some(b) => b,
-        None => return Err(uefi::Error::new(uefi::Status::UNSUPPORTED, ())),
-    };
-
-    crate::info!("Btrfs detected. Searching for /Core/Boot/vmlinuz-linux...");
-
-    let mut current_fs_root = btrfs.get_fs_root()?;
-    let mut current_dir_id = 256;
-
-    // 1. Find Core
-    let (core_obj, core_type) = btrfs
-        .find_file_in_dir(current_fs_root, current_dir_id, "Core")?
-        .ok_or(uefi::Error::new(uefi::Status::NOT_FOUND, ()))?;
-
-    // Check if it is a subvolume (Root Item Key = 132)
-    if core_type == fs::btrfs::BTRFS_ROOT_ITEM_KEY {
-        crate::info!("Entering subvolume Core (ID {})", core_obj);
-        current_fs_root = btrfs.get_tree_root(core_obj)?;
-        current_dir_id = 256; // Root of new tree
-    } else {
-        // Just a directory
-        current_dir_id = core_obj;
-    }
-
-    // 2. Find Boot
-    let (boot_obj, _) = btrfs
-        .find_file_in_dir(current_fs_root, current_dir_id, "Boot")?
-        .ok_or(uefi::Error::new(uefi::Status::NOT_FOUND, ()))?;
-
-    // 3. Find vmlinuz-linux
-    let (kernel_obj, _) = btrfs
-        .find_file_in_dir(current_fs_root, boot_obj, "vmlinuz-linux")?
-        .ok_or(uefi::Error::new(uefi::Status::NOT_FOUND, ()))?;
-
-    // Also try to find initramfs just to check existence
-    let initrd_res = btrfs.find_file_in_dir(current_fs_root, boot_obj, "initramfs-linux.img")?;
-
-    if let Some((initrd_inode, _)) = initrd_res {
-        crate::info!("Found initramfs-linux.img, loading...");
-        let initrd_data = btrfs.read_file(current_fs_root, initrd_inode)?;
-        crate::info!("Initrd loaded ({} bytes).", initrd_data.len());
-
-        // Setup LoadFile2 for Initrd
-        unsafe {
-            INITRD_DATA = Some(initrd_data);
-
-            // LINUX_EFI_INITRD_MEDIA_GUID
-            // 5568e427-68fc-4f3d-ac74-ca555231cc68
-
-            // Construct Device Path
-            // Vendor Device Path (Type 4, SubType 3)
-            // Header (4) + Guid (16) = 20 bytes
-            // End (Type 0x7F, SubType 0xFF, Len 4)
-            let device_path_data: [u8; 24] = [
-                0x04, 0x03, 0x14, 0x00, // Vendor Path Header
-                0x27, 0xe4, 0x68, 0x55, 0xfc, 0x68, 0x3d, 0x4f, // GUID Part 1
-                0xac, 0x74, 0xca, 0x55, 0x52, 0x31, 0xcc, 0x68, // GUID Part 2
-                0x7f, 0xff, 0x04, 0x00, // End Path
-            ];
-
-            // Install protocol
-            let load_file2 = EfiLoadFile2 {
-                load_file: load_file2_initrd,
-            };
-
-            let load_file2_guid = uefi::proto::media::load_file::LoadFile2::GUID;
-            let device_path_guid = uefi::proto::device_path::DevicePath::GUID;
-
-            // Allocate DP on heap and leak it
-            let dp_ptr = alloc::alloc::alloc(alloc::alloc::Layout::from_size_align(24, 4).unwrap());
-            core::ptr::copy_nonoverlapping(device_path_data.as_ptr(), dp_ptr, 24);
-
-            // Create a new handle with DevicePath first
-            let new_handle = uefi::boot::install_protocol_interface(
-                None,
-                &device_path_guid,
-                dp_ptr as *mut core::ffi::c_void,
-            )?;
-
-            // Install LoadFile2 on that handle
-            // Allocate protocol struct on heap and leak it
-            let lf2_ptr = alloc::alloc::alloc(alloc::alloc::Layout::new::<EfiLoadFile2>());
-            core::ptr::write(lf2_ptr as *mut EfiLoadFile2, load_file2);
-
-            uefi::boot::install_protocol_interface(
-                Some(new_handle),
-                &load_file2_guid,
-                lf2_ptr as *mut core::ffi::c_void,
-            )?;
-
-            crate::info!("Initrd LoadFile2 protocol installed.");
-        }
-    }
-
-    crate::info!("Reading kernel...");
-    let kernel_data = btrfs.read_file(current_fs_root, kernel_obj)?;
-    crate::info!("Kernel loaded ({} bytes). Starting...", kernel_data.len());
-
-    let handle = uefi::boot::load_image(
-        uefi::boot::image_handle(),
-        uefi::boot::LoadImageSource::FromBuffer {
-            buffer: &kernel_data,
-            file_path: None,
-        },
-    )?;
-
-    // Command line: root=UUID=... rw rootflags=compress=zstd:1 init=/Core/sbin/init console=ttyS0
-    let uuid = btrfs.get_uuid();
-    let cmdline = format!(
-        "root=UUID={} rw rootflags=compress=zstd:1 init=/Core/sbin/init console=ttyS0",
-        uuid
-    );
-    let mut cmdline_utf16: Vec<u16> = cmdline.encode_utf16().collect();
-    cmdline_utf16.push(0); // Null terminate
-
-    let mut loaded_image = uefi::boot::open_protocol_exclusive::<LoadedImage>(handle)?;
-
-    unsafe {
-        loaded_image.set_load_options(
-            cmdline_utf16.as_ptr() as *const u8,
-            (cmdline_utf16.len() * 2) as u32,
-        );
-    }
-    drop(loaded_image);
-
-    uefi::boot::start_image(handle)?;
-    Ok(())
-}
-
-static mut INITRD_DATA: Option<Vec<u8>> = None;
-
-unsafe extern "efiapi" fn load_file2_initrd(
-    _this: *mut core::ffi::c_void,
-    _file_path: *const core::ffi::c_void,
-    _boot_policy: bool,
-    buffer_size: *mut usize,
-    buffer: *mut u8,
-) -> uefi::Status {
-    if buffer_size.is_null() {
-        return uefi::Status::INVALID_PARAMETER;
-    }
-
-    let data = match unsafe { &*core::ptr::addr_of!(INITRD_DATA) } {
-        Some(d) => d,
-        None => return uefi::Status::NOT_FOUND,
-    };
-
-    let required_size = data.len();
-    let available_size = *buffer_size;
-
-    *buffer_size = required_size;
-
-    if buffer.is_null() || available_size < required_size {
-        return uefi::Status::BUFFER_TOO_SMALL;
-    }
-
-    core::ptr::copy_nonoverlapping(data.as_ptr(), buffer, required_size);
     uefi::Status::SUCCESS
 }
 

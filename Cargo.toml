@@ -9,6 +9,7 @@ uefi-raw = "0.9.0"
 embedded-graphics = "0.8.1"
 fontdue = { version = "0.8", default-features = false }
 qoi = { version = "0.4", default-features = false }
+sha2 = { version = "0.10", default-features = false }
 
 [profile.dev]
 panic = "abort"

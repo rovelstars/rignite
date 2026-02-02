@@ -23,8 +23,8 @@ if [ -d "$MOUNT_DIR" ]; then
 fi
 rm -f "$IMAGE"
 
-echo "Creating 2G raw disk image..."
-qemu-img create -f raw "$IMAGE" 2G
+echo "Creating 200MB raw disk image..."
+qemu-img create -f raw "$IMAGE" 200M
 
 echo "Formatting as Btrfs (Label: RunixOS)..."
 mkfs.btrfs --label "RunixOS" "$IMAGE"

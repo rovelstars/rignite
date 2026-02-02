@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">Rignite Flasher</string>
+    <string name="status_disconnected">Status: Disconnected</string>
+    <string name="status_connected">Status: Connected (Accessory Mode)</string>
+    <string name="btn_select_file">Select OS Image</string>
+    <string name="btn_flash">Flash to Rignite</string>
+    <string name="log_waiting">Waiting for USB connection...</string>
+</resources>
