@@ -1,0 +1,25 @@
+# Rignite Binary Config (RBC) Source Configuration
+# Used by rbc_cli to generate the binary boot.rbc blob
+
+[main]
+# UUID of the partition containing the root filesystem
+uuid = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+
+# File System Type ID:
+# 1 = Btrfs
+# 2 = Ext4
+# 3 = XFS
+fs_type = 1
+
+# Linux Kernel Command Line Parameters
+kernel_params = "root=UUID=a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11 root=/dev/vda rw rootfstype=btrfs init=/Core/sbin/init console=ttyS0 quiet splash loglevel=3 systemd.show_status=false"
+
+[recovery]
+uuid = "b1ffcd88-8d0a-3de7-aa5c-5cc8ac270b22"
+
+# File System Type ID:
+# 10 = EROFS
+# 11 = SquashFS
+fs_type = 11
+
+kernel_params = "root=UUID=b1ffcd88-8d0a-3de7-aa5c-5cc8ac270b22 ro init=/init rescue"

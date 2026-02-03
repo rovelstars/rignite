@@ -11,3 +11,16 @@ Rignite is a high-performance, optimized UEFI bootloader written in Rust. It is 
 - **Open Source**: Rignite is open source, encouraging community contributions and collaboration.
 - **Graphical Based Bootloader**: Rignite features a graphical user interface (GUI) for a more user-friendly boot experience.
 - **Filesystem Support**: Currently supports BTRFS filesystem for loading the OS kernel and initramfs. Looking to add support for more filesystems in the future, as well as boot other OSes.
+
+# FAT BOOT Layout
+
+Rignite follows the UEFI standard specification, which requires a FAT32 formatted boot layout to function correctly. The following structure is be followed:
+
+```/
+├── EFI
+│   └── BOOT
+│       └── BOOTX64.EFI  (Rignite bootloader binary - always named BOOTX64.EFI for x86_64 architecture)
+│   └── RovelStars
+│       └── RIGNITEX64.EFI  (Alternative location for Rignite bootloader binary, as backup)
+│       └── CONF (Configuration file for Rignite - maintains settings and preferences)
+```

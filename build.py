@@ -111,7 +111,9 @@ def prepare_assets():
 
         try:
             # Try rsvg-convert
-            run_command(f"rsvg-convert -w {pixel_size} -h {pixel_size} -f png -o {png_path} {svg_src}")
+            run_command(
+                f"rsvg-convert -w {pixel_size} -h {pixel_size} -f png -o {png_path} {svg_src}"
+            )
         except subprocess.CalledProcessError:
             try:
                 # Try convert
@@ -145,6 +147,22 @@ def prepare_assets():
             print(f"Warning: PNG generation failed for {svg_name}")
 
 
+def generate_rbc_config():
+    print("Generating RBC configuration...")
+
+    # Ensure destination directory exists
+    conf_dir = os.path.join(OUTPUT_DIR, "esp", "EFI", "RovelStars", "CONF")
+    os.makedirs(conf_dir, exist_ok=True)
+
+    output_path = os.path.join(conf_dir, "boot.rbc")
+    config_toml = os.path.join("rbc_cli", "config.toml")
+
+    # Build and run rbc_cli
+    # We use --manifest-path to point to the nested project
+    cmd = f'cargo run --manifest-path rbc_cli/Cargo.toml -- "{config_toml}" "{output_path}"'
+    run_command(cmd)
+
+
 def build_uefi(arch="x86_64"):
     prepare_assets()
     target = TARGET_ARCH.get(arch)
@@ -168,6 +186,9 @@ def build_uefi(arch="x86_64"):
         dst_efi = os.path.join(efi_boot_dir, "BOOTAA64.EFI")
 
     shutil.copy(src_efi, dst_efi)
+
+    generate_rbc_config()
+
     print(f"Build complete. ESP at {os.path.join(OUTPUT_DIR, 'esp')}")
 
 

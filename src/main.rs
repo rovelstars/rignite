@@ -24,6 +24,7 @@ mod icons;
 mod input;
 mod logger;
 mod logo;
+mod rbc;
 
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::RgbColor;
@@ -92,6 +93,18 @@ pub extern "C" fn efi_main(
     let reboot_icon = Icon::new(reboot_icon_data, 32, 32);
     let shutdown_icon = Icon::new(shutdown_icon_data, 32, 32);
     let logo_icon = logo::Logo::new();
+
+    // Load Configuration
+    let config = match rbc::verify_and_load("\\EFI\\RovelStars\\CONF\\boot.rbc") {
+        Ok(c) => {
+            crate::info!("Loaded boot configuration.");
+            Some(c)
+        }
+        Err(e) => {
+            crate::warn!("Failed to load boot config: {:?}. Using defaults.", e);
+            None
+        }
+    };
 
     // Scan for Block Devices
     let handles = uefi::boot::locate_handle_buffer(SearchType::ByProtocol(&BlockIO::GUID))
@@ -322,7 +335,11 @@ pub extern "C" fn efi_main(
         if !enter_menu {
             if let Some(handle) = runixos_handle {
                 crate::info!("Auto-booting RunixOS...");
-                if let Err(e) = boot::boot_linux_from_drive(handle) {
+                let params = config
+                    .as_ref()
+                    .and_then(|c| c.get_main_kernel_params().ok().flatten());
+
+                if let Err(e) = boot::boot_linux_from_drive(handle, params) {
                     crate::error!("Failed to auto-boot: {:?}", e);
                     enter_menu = true;
                 } else {
@@ -581,13 +598,25 @@ pub extern "C" fn efi_main(
                         *redraw.borrow_mut() = true;
                     }
                     Key::Printable(c) if u16::from(c) == '\r' as u16 => {
+                        // Clear screen before action
+                        {
+                            let mut d = display.borrow_mut();
+                            d.clear(Rgb888::new(0, 0, 0)).ok();
+                            d.flush();
+                        }
+
                         let selected = &menu_items[*idx];
                         match selected {
                             MenuItem::Drive { name, handle } => {
                                 crate::info!("Booting from drive: {}", name);
                                 if let Some(h) = handle {
-                                    if let Err(e) = boot::boot_linux_from_drive(*h) {
+                                    let params = config
+                                        .as_ref()
+                                        .and_then(|c| c.get_main_kernel_params().ok().flatten());
+
+                                    if let Err(e) = boot::boot_linux_from_drive(*h, params) {
                                         crate::error!("Boot failed: {:?}", e);
+                                        *redraw.borrow_mut() = true;
                                     }
                                 }
                             }

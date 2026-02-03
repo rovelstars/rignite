@@ -196,7 +196,10 @@ pub fn boot_from_memory(
     Ok(())
 }
 
-pub fn boot_linux_from_drive(handle: uefi::Handle) -> uefi::Result<()> {
+pub fn boot_linux_from_drive(
+    handle: uefi::Handle,
+    cmdline_override: Option<&str>,
+) -> uefi::Result<()> {
     let mut block_io = uefi::boot::open_protocol_exclusive::<BlockIO>(handle)?;
 
     let mut btrfs = match fs::btrfs::Btrfs::new(&mut block_io)? {
@@ -254,12 +257,14 @@ pub fn boot_linux_from_drive(handle: uefi::Handle) -> uefi::Result<()> {
     let uuid = btrfs.get_uuid();
     // Use /dev/vda fallback for QEMU if UUID resolution fails in initrd (common in minimal dev envs)
     // Also add rootfstype=btrfs to prevent ext4 probe noise
-    let cmdline = format!(
+    let default_cmdline = format!(
         "root=UUID={} root=/dev/vda rw rootfstype=btrfs init=/Core/sbin/init console=ttyS0",
         uuid
     );
 
+    let cmdline = cmdline_override.unwrap_or(&default_cmdline);
+
     crate::info!("Kernel Command Line: {}", cmdline);
 
-    boot_from_memory(&kernel_data, initrd_data, &cmdline)
+    boot_from_memory(&kernel_data, initrd_data, cmdline)
 }
