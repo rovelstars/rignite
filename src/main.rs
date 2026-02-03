@@ -24,7 +24,6 @@ mod icons;
 mod input;
 mod logger;
 mod logo;
-mod rdf;
 
 use embedded_graphics::pixelcolor::Rgb888;
 use embedded_graphics::prelude::RgbColor;
@@ -107,7 +106,6 @@ pub extern "C" fn efi_main(
         FirmwareSettings,
         Reboot,
         Shutdown,
-        Recovery,
     }
 
     let mut menu_items = Vec::new();
@@ -183,7 +181,6 @@ pub extern "C" fn efi_main(
     menu_items.push(MenuItem::FirmwareSettings);
     menu_items.push(MenuItem::Reboot);
     menu_items.push(MenuItem::Shutdown);
-    menu_items.push(MenuItem::Recovery);
 
     use core::cell::RefCell;
     let display = RefCell::new(display);
@@ -495,9 +492,9 @@ pub extern "C" fn efi_main(
 
                 // Draw system options at bottom (smaller than drives)
                 let sys_icon_size = (icon_size * 3) / 10; // 30% of drive icon size
-                let sys_options_y = height as i32 - sys_icon_size as i32 - 80;
-                let sys_option_count = 4; // Firmware, Reboot, Shutdown, Recovery (RFU)
-                let sys_item_width = (sys_icon_size * 2) as i32;
+                let sys_options_y = height as i32 - sys_icon_size as i32 - 80; // 80px margin from bottom
+                let sys_option_count = 3; // Firmware, Reboot, Shutdown
+                let sys_item_width = (sys_icon_size * 3) as i32; // Spacing b/w system options
                 let sys_start_x = (width as i32 / 2) - ((sys_option_count * sys_item_width) / 2);
 
                 let mut sys_idx = 0;
@@ -506,7 +503,6 @@ pub extern "C" fn efi_main(
                         MenuItem::FirmwareSettings => (&firmware_icon, "FW"),
                         MenuItem::Reboot => (&reboot_icon, "Reboot"),
                         MenuItem::Shutdown => (&shutdown_icon, "Shutdown"),
-                        MenuItem::Recovery => (&firmware_icon, "RFU"),
                         MenuItem::Drive { .. } => continue,
                     };
 
@@ -646,257 +642,6 @@ pub extern "C" fn efi_main(
                                     uefi::Status::SUCCESS,
                                     None,
                                 );
-                            }
-                            MenuItem::Recovery => {
-                                crate::info!("Entering Recovery Mode...");
-                                let mut recovery_selected_idx = 0;
-                                let mut devices = Vec::new();
-                                let mut scan_counter = 10; // Force initial scan
-
-                                loop {
-                                    // Poll devices every 1s (10 * 100ms)
-                                    if scan_counter >= 10 {
-                                        scan_counter = 0;
-                                        match rdf::RdfManager::list_devices() {
-                                            Ok(d) => devices = d,
-                                            Err(e) => {
-                                                crate::warn!("Error listing devices: {:?}", e);
-                                            }
-                                        };
-                                    }
-                                    scan_counter += 1;
-
-                                    let mut disp = display.borrow_mut();
-                                    disp.clear(Rgb888::new(0, 0, 0)).ok();
-                                    font_renderer.draw_text(
-                                        &mut *disp,
-                                        "Recovery Mode - Select Device:",
-                                        20,
-                                        20,
-                                        20.0,
-                                        Rgb888::new(255, 255, 255),
-                                    );
-
-                                    // Draw Debug Console (Last 10 lines)
-                                    let logs = logger::get_logs();
-                                    for (i, entry) in logs.iter().rev().take(10).enumerate() {
-                                        let color = match entry.level {
-                                            "ERR" => Rgb888::new(255, 100, 100),
-                                            "WRN" => Rgb888::new(255, 255, 0),
-                                            "DBG" => Rgb888::new(100, 100, 100),
-                                            _ => Rgb888::new(200, 200, 200),
-                                        };
-                                        // Draw from bottom up
-                                        font_renderer.draw_text(
-                                            &mut *disp,
-                                            &format!("[{}] {}", entry.level, entry.message),
-                                            20,
-                                            height as i32 - 20 - (i as i32 * 16),
-                                            14.0,
-                                            color,
-                                        );
-                                    }
-
-                                    if devices.is_empty() {
-                                        font_renderer.draw_text(
-                                            &mut *disp,
-                                            "No USB IO devices found.",
-                                            20,
-                                            60,
-                                            16.0,
-                                            Rgb888::new(200, 200, 200),
-                                        );
-                                    } else {
-                                        if recovery_selected_idx >= devices.len() {
-                                            recovery_selected_idx = 0;
-                                        }
-
-                                        for (i, dev) in devices.iter().enumerate() {
-                                            let is_selected = i == recovery_selected_idx;
-                                            let prefix = if is_selected { "> " } else { "  " };
-                                            let info = format!(
-                                                "{}VID: {:#06x} PID: {:#06x}",
-                                                prefix, dev.vid, dev.pid
-                                            );
-
-                                            let color = if is_selected {
-                                                Rgb888::new(255, 255, 0)
-                                            } else {
-                                                Rgb888::new(200, 255, 200)
-                                            };
-
-                                            font_renderer.draw_text(
-                                                &mut *disp,
-                                                &info,
-                                                20,
-                                                60 + (i as i32 * 20),
-                                                16.0,
-                                                color,
-                                            );
-                                        }
-                                    }
-
-                                    font_renderer.draw_text(
-                                        &mut *disp,
-                                        "Press ENTER to flash, ESC to return...",
-                                        20,
-                                        height as i32 - 200,
-                                        16.0,
-                                        Rgb888::new(150, 150, 150),
-                                    );
-
-                                    disp.flush();
-                                    uefi::boot::stall(100_000); // 100ms
-
-                                    if let Some(key) = input_handler.read_key() {
-                                        match key {
-                                            Key::Special(ScanCode::ESCAPE) => break,
-                                            Key::Special(ScanCode::UP) => {
-                                                if recovery_selected_idx > 0 {
-                                                    recovery_selected_idx -= 1;
-                                                }
-                                            }
-                                            Key::Special(ScanCode::DOWN) => {
-                                                if !devices.is_empty()
-                                                    && recovery_selected_idx < devices.len() - 1
-                                                {
-                                                    recovery_selected_idx += 1;
-                                                }
-                                            }
-                                            Key::Printable(c) if u16::from(c) == '\r' as u16 => {
-                                                if !devices.is_empty() {
-                                                    let dev = &devices[recovery_selected_idx];
-
-                                                    // Drop display lock to allow callback to use it
-                                                    drop(disp);
-
-                                                    let res = rdf::RdfManager::download_image(
-                                                        dev,
-                                                        |curr, total| {
-                                                            let mut d = display.borrow_mut();
-                                                            d.clear(Rgb888::new(0, 0, 20)).ok();
-
-                                                            let progress = if total > 0 {
-                                                                (curr as f32 / total as f32 * 100.0)
-                                                                    as u32
-                                                            } else {
-                                                                0
-                                                            };
-
-                                                            font_renderer.draw_text(
-                                                                &mut *d,
-                                                                "Flashing in progress...",
-                                                                20,
-                                                                20,
-                                                                20.0,
-                                                                Rgb888::new(255, 255, 255),
-                                                            );
-
-                                                            let status = format!(
-                                                                "Received: {} / {} bytes",
-                                                                curr, total
-                                                            );
-                                                            font_renderer.draw_text(
-                                                                &mut *d,
-                                                                &status,
-                                                                20,
-                                                                60,
-                                                                16.0,
-                                                                Rgb888::new(200, 200, 200),
-                                                            );
-
-                                                            // Draw simple bar
-                                                            let filled_len =
-                                                                (progress as usize / 5).min(20);
-                                                            let empty_len = 20 - filled_len;
-                                                            let mut bar_str = String::from("[");
-                                                            for _ in 0..filled_len {
-                                                                bar_str.push('=');
-                                                            }
-                                                            for _ in 0..empty_len {
-                                                                bar_str.push(' ');
-                                                            }
-                                                            bar_str.push(']');
-                                                            let bar_display = format!(
-                                                                "{} {}%",
-                                                                bar_str, progress
-                                                            );
-
-                                                            font_renderer.draw_text(
-                                                                &mut *d,
-                                                                &bar_display,
-                                                                20,
-                                                                100,
-                                                                16.0,
-                                                                Rgb888::new(0, 255, 0),
-                                                            );
-                                                            d.flush();
-                                                        },
-                                                    );
-
-                                                    match res {
-                                                        Ok(downloaded_image) => {
-                                                            crate::info!("Flashing Complete!");
-                                                            uefi::boot::stall(1_000_000);
-
-                                                            crate::info!(
-                                                                "Attempting to boot from RAM..."
-                                                            );
-                                                            let cmdline = "console=ttyS0";
-                                                            // Note: boot_from_memory might not return if successful
-                                                            if let Err(e) = boot::boot_from_memory(
-                                                                &downloaded_image,
-                                                                None,
-                                                                cmdline,
-                                                            ) {
-                                                                crate::error!(
-                                                                    "RAM Boot failed: {:?}",
-                                                                    e
-                                                                );
-                                                                // Need to re-borrow display to show error
-                                                                let mut d = display.borrow_mut();
-                                                                let err_msg =
-                                                                    format!("Boot Error: {:?}", e);
-                                                                font_renderer.draw_text(
-                                                                    &mut *d,
-                                                                    &err_msg,
-                                                                    20,
-                                                                    140,
-                                                                    16.0,
-                                                                    Rgb888::new(255, 0, 0),
-                                                                );
-                                                                d.flush();
-                                                                uefi::boot::stall(5_000_000);
-                                                            }
-                                                            break;
-                                                        }
-                                                        Err(e) => {
-                                                            crate::error!(
-                                                                "Download failed: {:?}",
-                                                                e
-                                                            );
-                                                            let mut d = display.borrow_mut();
-                                                            let err_msg =
-                                                                format!("Download Error: {:?}", e);
-                                                            font_renderer.draw_text(
-                                                                &mut *d,
-                                                                &err_msg,
-                                                                20,
-                                                                140,
-                                                                16.0,
-                                                                Rgb888::new(255, 0, 0),
-                                                            );
-                                                            d.flush();
-                                                            uefi::boot::stall(3_000_000);
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                                *redraw.borrow_mut() = true;
                             }
                         }
                     }
