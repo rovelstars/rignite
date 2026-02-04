@@ -1,8 +1,13 @@
 use alloc::format;
+use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::ffi::c_void;
+use uefi::proto::device_path::{DevicePath, FfiDevicePath};
 use uefi::proto::loaded_image::LoadedImage;
 use uefi::proto::media::block::BlockIO;
+use uefi::proto::media::file::{File, FileAttribute, FileInfo, FileMode, FileType};
+use uefi::proto::media::fs::SimpleFileSystem;
+use uefi::CStr16;
 use uefi::Identify;
 
 use crate::fs;
@@ -196,15 +201,266 @@ pub fn boot_from_memory(
     Ok(())
 }
 
+pub fn scan_dir_recursive(
+    dir: &mut uefi::proto::media::file::Directory,
+    path_prefix: &str,
+    apps: &mut Vec<alloc::string::String>,
+    quibble_path: &mut Option<alloc::string::String>,
+) {
+    let mut buf = [0u8; 512];
+    loop {
+        match dir.read_entry(&mut buf) {
+            Ok(Some(entry)) => {
+                let name = entry.file_name().to_string();
+                if name == "." || name == ".." {
+                    continue;
+                }
+
+                let full_path = format!("{}\\{}", path_prefix, name);
+                let is_dir = entry
+                    .attribute()
+                    .contains(uefi::proto::media::file::FileAttribute::DIRECTORY);
+
+                if is_dir {
+                    // Recurse (Limited depth implicitly by stack/structure)
+                    if let Ok(handle) =
+                        dir.open(entry.file_name(), FileMode::Read, FileAttribute::empty())
+                    {
+                        if let Ok(FileType::Dir(mut subdir)) = handle.into_type() {
+                            scan_dir_recursive(&mut subdir, &full_path, apps, quibble_path);
+                        }
+                    }
+                } else {
+                    let name_lower = name.to_lowercase();
+                    if name_lower.ends_with(".efi") {
+                        apps.push(full_path.clone());
+                        if name_lower.contains("quibble.efi") {
+                            *quibble_path = Some(full_path);
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+}
+
+pub fn boot_efi_app(handle: uefi::Handle, path_str: &str) -> uefi::Result<()> {
+    crate::info!("Chainloading: {}", path_str);
+
+    // 1. Get Volume Device Path
+    let volume_dp = unsafe {
+        uefi::boot::open_protocol::<DevicePath>(
+            uefi::boot::OpenProtocolParams {
+                handle,
+                agent: uefi::boot::image_handle(),
+                controller: None,
+            },
+            uefi::boot::OpenProtocolAttributes::GetProtocol,
+        )
+        .map_err(|e| uefi::Error::new(e.status(), ()))?
+    };
+
+    // 2. Construct Full Device Path (Volume + File Path + End)
+    let mut dp_data = Vec::new();
+    let mut src_ptr = volume_dp.as_ffi_ptr() as *const u8;
+
+    // Copy Volume DP nodes
+    loop {
+        let type_ = unsafe { *src_ptr };
+        let subtype = unsafe { *src_ptr.add(1) };
+        if type_ == 0x7f && subtype == 0xff {
+            break; // Stop before End Node
+        }
+        let len_lo = unsafe { *src_ptr.add(2) };
+        let len_hi = unsafe { *src_ptr.add(3) };
+        let len = (len_hi as usize) << 8 | (len_lo as usize);
+
+        let node_slice = unsafe { core::slice::from_raw_parts(src_ptr, len) };
+        dp_data.extend_from_slice(node_slice);
+
+        src_ptr = unsafe { src_ptr.add(len) };
+    }
+
+    // Create File Path Node
+    // Normalization
+    let clean_path = path_str.replace('/', "\\");
+    let clean_path = if !clean_path.starts_with('\\') {
+        format!("\\{}", clean_path)
+    } else {
+        clean_path
+    };
+
+    let path_u16: Vec<u16> = clean_path
+        .encode_utf16()
+        .chain(core::iter::once(0))
+        .collect();
+    let path_size_bytes = path_u16.len() * 2;
+    let node_size = 4 + path_size_bytes;
+
+    dp_data.push(0x04); // Type: Media
+    dp_data.push(0x04); // SubType: File Path
+    dp_data.push(node_size as u8);
+    dp_data.push((node_size >> 8) as u8);
+
+    let path_bytes =
+        unsafe { core::slice::from_raw_parts(path_u16.as_ptr() as *const u8, path_size_bytes) };
+    dp_data.extend_from_slice(path_bytes);
+
+    // Append End Node (Type 0x7f, SubType 0xff, Len 4)
+    dp_data.extend_from_slice(&[0x7f, 0xff, 0x04, 0x00]);
+
+    // Create DevicePath reference from buffer
+    let file_dp = unsafe { DevicePath::from_ffi_ptr(dp_data.as_ptr() as *const FfiDevicePath) };
+
+    // 3. Read file for PE Validation
+    let mut fs_proto = unsafe {
+        uefi::boot::open_protocol::<SimpleFileSystem>(
+            uefi::boot::OpenProtocolParams {
+                handle,
+                agent: uefi::boot::image_handle(),
+                controller: None,
+            },
+            uefi::boot::OpenProtocolAttributes::GetProtocol,
+        )
+        .map_err(|e| uefi::Error::new(e.status(), ()))?
+    };
+    let fs = &mut *fs_proto;
+    let mut root = fs.open_volume()?;
+
+    let mut path_buf = [0u16; 256];
+    let clean_path_open = path_str.trim_start_matches('\\');
+    let path_cstr = CStr16::from_str_with_buf(clean_path_open, &mut path_buf)
+        .map_err(|_| uefi::Status::INVALID_PARAMETER)?;
+
+    let file_handle = root.open(path_cstr, FileMode::Read, FileAttribute::empty())?;
+    let mut file = match file_handle.into_type()? {
+        FileType::Regular(f) => f,
+        _ => return Err(uefi::Status::UNSUPPORTED.into()),
+    };
+
+    let mut info_buf = [0u8; 256];
+    let info = file
+        .get_info::<FileInfo>(&mut info_buf)
+        .map_err(|e| uefi::Error::new(e.status(), ()))?;
+    let size = info.file_size() as usize;
+
+    let mut code_buf = vec![0u8; size];
+    file.read(&mut code_buf)
+        .map_err(|e| uefi::Error::new(e.status(), ()))?;
+
+    // Validate PE
+    validate_kernel_pe(&code_buf)?;
+
+    // Load & Start using Buffer AND DevicePath
+    let image_handle = uefi::boot::load_image(
+        uefi::boot::image_handle(),
+        uefi::boot::LoadImageSource::FromBuffer {
+            buffer: &code_buf,
+            file_path: Some(file_dp),
+        },
+    )?;
+
+    crate::info!("Starting Chainloaded App...");
+
+    // Reset Console Output to Text Mode
+    uefi::system::with_stdout(|stdout| {
+        let _ = stdout.reset(false);
+        if let Some(mode) = stdout.modes().next() {
+            let _ = stdout.set_mode(mode);
+        }
+        let _ = stdout.clear();
+    });
+
+    uefi::boot::start_image(image_handle)?;
+    crate::info!("Chainloaded App Returned.");
+
+    Ok(())
+}
+
+fn try_boot_fat_fallback(handle: uefi::Handle) -> uefi::Result<()> {
+    crate::warn!("Btrfs failed. Attempting FAT/EFI Chainload Fallback...");
+
+    // Open FS non-exclusively (GetProtocol)
+    let mut fs_proto = unsafe {
+        uefi::boot::open_protocol::<SimpleFileSystem>(
+            uefi::boot::OpenProtocolParams {
+                handle,
+                agent: uefi::boot::image_handle(),
+                controller: None,
+            },
+            uefi::boot::OpenProtocolAttributes::GetProtocol,
+        )
+        .map_err(|_| {
+            crate::error!("No Filesystem found on drive.");
+            uefi::Error::from(uefi::Status::UNSUPPORTED)
+        })?
+    };
+
+    // ScopedProtocol derefs to SimpleFileSystem.
+    let fs = &mut *fs_proto;
+    let mut root = fs.open_volume()?;
+    let mut apps = Vec::new();
+    let mut quibble_path = None;
+
+    scan_dir_recursive(&mut root, "", &mut apps, &mut quibble_path);
+
+    if apps.is_empty() {
+        crate::warn!("No EFI applications found.");
+        return Err(uefi::Error::new(uefi::Status::NOT_FOUND, ()));
+    }
+
+    crate::info!("Found EFI Applications:");
+    for app in &apps {
+        crate::info!(" - {}", app);
+    }
+
+    let target = quibble_path
+        .or_else(|| {
+            apps.iter()
+                .find(|a| {
+                    let low = a.to_lowercase();
+                    low.contains("bootx64.efi") || low.contains("bootmgfw.efi")
+                })
+                .cloned()
+        })
+        .or_else(|| apps.first().cloned());
+
+    if let Some(path_str) = target {
+        boot_efi_app(handle, &path_str)?;
+    }
+
+    Ok(())
+}
+
 pub fn boot_linux_from_drive(
     handle: uefi::Handle,
     cmdline_override: Option<&str>,
 ) -> uefi::Result<()> {
-    let mut block_io = uefi::boot::open_protocol_exclusive::<BlockIO>(handle)?;
+    // 1. Try BlockIO + Btrfs
+    // Use GetProtocol to avoid disconnecting SimpleFileSystem driver which we might need for fallback
+    let block_io = match unsafe {
+        uefi::boot::open_protocol::<BlockIO>(
+            uefi::boot::OpenProtocolParams {
+                handle,
+                agent: uefi::boot::image_handle(),
+                controller: None,
+            },
+            uefi::boot::OpenProtocolAttributes::GetProtocol,
+        )
+    } {
+        Ok(io) => io,
+        Err(_) => return try_boot_fat_fallback(handle),
+    };
 
-    let mut btrfs = match fs::btrfs::Btrfs::new(&mut block_io)? {
-        Some(b) => b,
-        None => return Err(uefi::Error::new(uefi::Status::UNSUPPORTED, ())),
+    let mut btrfs = match fs::btrfs::Btrfs::new(&block_io) {
+        Ok(Some(b)) => b,
+        _ => {
+            // Drop block_io to release handle (though GetProtocol doesn't lock it, scoping is good)
+            drop(block_io);
+            return try_boot_fat_fallback(handle);
+        }
     };
 
     crate::info!("Btrfs detected. Searching for /Core/Boot/vmlinuz-linux...");

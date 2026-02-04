@@ -282,13 +282,13 @@ pub struct ChunkMap {
 }
 
 pub struct Btrfs<'a> {
-    block_io: &'a mut BlockIO,
+    block_io: &'a BlockIO,
     pub sb: BtrfsSuperBlock,
     pub chunks: Vec<ChunkMap>,
 }
 
 impl<'a> Btrfs<'a> {
-    pub fn new(block_io: &'a mut BlockIO) -> Result<Option<Self>> {
+    pub fn new(block_io: &'a BlockIO) -> Result<Option<Self>> {
         // Allocate aligned buffer (4096 bytes)
         // Some UEFI implementations (and QEMU virtio) require IO buffers to be aligned.
         let mut raw_buffer = vec![0u8; 4096 + 4096];

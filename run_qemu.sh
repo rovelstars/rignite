@@ -26,13 +26,13 @@ fi
 if [ "$ARCH" == "x86_64" ]; then
     qemu-system-x86_64 \
         -enable-kvm \
-        -m 1G -smp 4 \
+        -smp 4 -m 1G \
         -drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE \
         -drive if=pflash,format=raw,file=$OVMF_VARS \
         -drive format=raw,file=fat:rw:$ESP_DIR \
         -drive file=disk.img,if=none,id=drive0,format=raw \
         -device virtio-blk-pci,drive=drive0 \
-        -vga none -device ramfb \
+        -vga virtio \
         -device qemu-xhci -device usb-tablet -device usb-kbd \
         -device usb-host,vendorid=0x22d9,productid=0x$USB_PID,guest-reset=false \
         -device usb-host,vendorid=0x18d1,guest-reset=false \
@@ -47,15 +47,16 @@ qemu-system-aarch64 \
     -smp 4 -m 1G \
     -drive if=pflash,format=raw,readonly=on,file=$AAVMF_CODE \
     -drive if=pflash,format=raw,file=$AAVMF_VARS \
-    -drive format=raw,file=fat:rw:$ESP_DIR \
+    -drive format=raw,file=fat:rw:$ESP_DIR,if=none,id=esp \
+    -device virtio-blk-pci,drive=esp,bootindex=0 \
     -drive file=disk.img,if=none,id=drive0,format=raw \
     -device virtio-blk-pci,drive=drive0 \
-    -vga none -device ramfb \
+    -vga none -device virtio-gpu-pci \
     -device qemu-xhci -device usb-tablet -device usb-kbd \
     -device usb-host,vendorid=0x22d9,productid=0x$USB_PID,guest-reset=false \
     -device usb-host,vendorid=0x18d1,guest-reset=false \
     -monitor unix:qemu-monitor.sock,server,nowait \
-    -display gtk,gl=on -serial stdio \
+    -display gtk,gl=off -serial stdio \
     -boot menu=on,splash-time=0
 else
     echo "Unknown arch: $ARCH"

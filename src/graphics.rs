@@ -1,5 +1,5 @@
 use embedded_graphics::{draw_target::DrawTarget, geometry::Size, pixelcolor::Rgb888, prelude::*};
-use uefi::proto::console::gop::{GraphicsOutput, PixelFormat};
+use uefi::proto::console::gop::{BltOp, BltPixel, BltRegion, GraphicsOutput, PixelFormat};
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -20,13 +20,35 @@ impl<'a> UefiDisplay<'a> {
     }
 
     pub fn flush(&mut self) {
-        let mut fb = self.gop.frame_buffer();
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                self.backbuffer.as_ptr(),
-                fb.as_mut_ptr(),
-                self.backbuffer.len(),
-            );
+        let mode_info = self.gop.current_mode_info();
+        if mode_info.pixel_format() == PixelFormat::BltOnly {
+            let (width, height) = mode_info.resolution();
+            let stride = mode_info.stride();
+            let pixels = unsafe {
+                core::slice::from_raw_parts(
+                    self.backbuffer.as_ptr() as *const BltPixel,
+                    self.backbuffer.len() / 4,
+                )
+            };
+
+            let _ = self.gop.blt(BltOp::BufferToVideo {
+                buffer: pixels,
+                src: BltRegion::SubRectangle {
+                    coords: (0, 0),
+                    px_stride: stride,
+                },
+                dest: (0, 0),
+                dims: (width, height),
+            });
+        } else {
+            let mut fb = self.gop.frame_buffer();
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.backbuffer.as_ptr(),
+                    fb.as_mut_ptr(),
+                    self.backbuffer.len(),
+                );
+            }
         }
     }
 
