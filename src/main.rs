@@ -16,6 +16,7 @@ use uefi::runtime::{ResetType, VariableAttributes, VariableVendor};
 use uefi::CStr16;
 use uefi::Identify;
 
+mod abctl;
 mod boot;
 mod font;
 mod fs;

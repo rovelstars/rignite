@@ -249,10 +249,15 @@ dependencies = [
  "embedded-graphics",
  "fontdue",
  "qoi",
+ "runix-bootctl",
  "sha2",
  "uefi",
  "uefi-raw",
 ]
+
+[[package]]
+name = "runix-bootctl"
+version = "0.1.0"
 
 [[package]]
 name = "sha2"
