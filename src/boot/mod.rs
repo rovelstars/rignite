@@ -463,7 +463,7 @@ pub fn boot_linux_from_drive(
         }
     };
 
-    crate::info!("Btrfs detected. Searching for /Core/Boot/vmlinuz-linux...");
+    crate::info!("Btrfs detected. Searching for /Core/Startup/vmlinuz-runixos...");
 
     let mut current_fs_root = btrfs.get_fs_root()?;
     let mut current_dir_id = 256;
@@ -483,21 +483,22 @@ pub fn boot_linux_from_drive(
         current_dir_id = core_obj;
     }
 
-    // 2. Find Boot
+    // 2. Find Startup (the RunixOS /boot dir; KernelFactory installs here)
     let (boot_obj, _) = btrfs
-        .find_file_in_dir(current_fs_root, current_dir_id, "Boot")?
+        .find_file_in_dir(current_fs_root, current_dir_id, "Startup")?
         .ok_or(uefi::Error::new(uefi::Status::NOT_FOUND, ()))?;
 
-    // 3. Find vmlinuz-linux
+    // 3. Find the kernel under the stable RunixOS name (KernelFactory writes a
+    //    vmlinuz-runixos alongside the versioned vmlinuz-<release>).
     let (kernel_obj, _) = btrfs
-        .find_file_in_dir(current_fs_root, boot_obj, "vmlinuz-linux")?
+        .find_file_in_dir(current_fs_root, boot_obj, "vmlinuz-runixos")?
         .ok_or(uefi::Error::new(uefi::Status::NOT_FOUND, ()))?;
 
-    // Also try to find initramfs just to check existence
-    let initrd_res = btrfs.find_file_in_dir(current_fs_root, boot_obj, "initramfs-linux.img")?;
+    // Also try to find the initramfs just to check existence
+    let initrd_res = btrfs.find_file_in_dir(current_fs_root, boot_obj, "initramfs-runixos.img")?;
 
     let initrd_data = if let Some((initrd_inode, _)) = initrd_res {
-        crate::info!("Found initramfs-linux.img, loading...");
+        crate::info!("Found initramfs-runixos.img, loading...");
         let data = btrfs.read_file(current_fs_root, initrd_inode)?;
         crate::info!("Initrd loaded ({} bytes).", data.len());
         Some(data)
@@ -509,12 +510,17 @@ pub fn boot_linux_from_drive(
     let kernel_data = btrfs.read_file(current_fs_root, kernel_obj)?;
     crate::info!("Kernel loaded ({} bytes). Starting...", kernel_data.len());
 
-    // Command line: root=UUID=... rw init=/Core/sbin/init console=ttyS0
+    // Command line. RunixOS init is Rev at /Core/Bin/rev (no /sbin in the FHS).
+    // This is the legacy direct-btrfs path: the kernel mounts the btrfs as root
+    // and execs Rev directly (no initramfs assembly). The composefs deployment
+    // path (initramfs + runix.deploy=<version> + runix.data=<dev>, consumed by
+    // runix-init) is selected via boot-control and is wired separately once the
+    // ESP-staging layout is finalized.
     let uuid = btrfs.get_uuid();
     // Use /dev/vda fallback for QEMU if UUID resolution fails in initrd (common in minimal dev envs)
     // Also add rootfstype=btrfs to prevent ext4 probe noise
     let default_cmdline = format!(
-        "root=UUID={} root=/dev/vda rw rootfstype=btrfs init=/Core/sbin/init console=ttyS0",
+        "root=UUID={} root=/dev/vda rw rootfstype=btrfs init=/Core/Bin/rev console=ttyS0",
         uuid
     );
 
