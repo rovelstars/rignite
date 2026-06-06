@@ -621,49 +621,122 @@ impl<'a> Btrfs<'a> {
     }
 
     pub fn read_file(&mut self, fs_root_logical: u64, inode: u64) -> Result<Vec<u8>> {
-        let key = BtrfsKey::new(inode, BTRFS_EXTENT_DATA_KEY, 0);
-        if let Some((leaf, item)) = self.search_slot(fs_root_logical, &key)? {
-            let data_ptr =
-                leaf.as_ptr() as usize + mem::size_of::<BtrfsHeader>() + item.offset as usize;
-            let extent = unsafe { (data_ptr as *const BtrfsFileExtentItem).read_unaligned() };
+        // A file is the concatenation of all its EXTENT_DATA items, keyed by
+        // (inode, EXTENT_DATA, file_offset). A large file (e.g. a 21MB kernel)
+        // spans many extents across many leaves, so walk the whole tree, collect
+        // every extent for this inode, order by file_offset, and read each one.
+        // The old single-search_slot path returned only the first extent, which
+        // truncated multi-extent files written by mkfs.btrfs --rootdir.
+        let node_size = self.sb.nodesize as usize;
+        let mut buf = vec![0u8; node_size];
 
-            if extent.compression != 0 {
-                crate::error!(
-                    "Btrfs: Compressed file detected (algo {}). Only uncompressed files supported.",
-                    extent.compression
-                );
-                return Err(Error::new(Status::UNSUPPORTED, ()));
+        // Collected fragments: (file_offset, bytes). A single INLINE extent short
+        // circuits (inline files are whole and small).
+        let mut frags: Vec<(u64, Vec<u8>)> = Vec::new();
+
+        let mut stack: Vec<u64> = vec![fs_root_logical];
+        while let Some(logical) = stack.pop() {
+            self.read_logical(logical, node_size, &mut buf)?;
+            let header = unsafe { (buf.as_ptr() as *const BtrfsHeader).read_unaligned() };
+            let items_start = mem::size_of::<BtrfsHeader>();
+
+            if header.level > 0 {
+                // Internal node: descend children whose key range may cover inode.
+                for i in 0..header.nritems as usize {
+                    let kp = unsafe {
+                        (buf.as_ptr().add(items_start) as *const BtrfsKeyPtr)
+                            .add(i)
+                            .read_unaligned()
+                    };
+                    // A big file spans many internal slots that all carry
+                    // objectid==inode (differing only by extent offset). Descend
+                    // when the next child still starts at or below inode, so the
+                    // lower-offset extents (including file offset 0) are not
+                    // skipped. >= not > is the whole point.
+                    let next_ge = if i + 1 < header.nritems as usize {
+                        let nk = unsafe {
+                            (buf.as_ptr().add(items_start) as *const BtrfsKeyPtr)
+                                .add(i + 1)
+                                .read_unaligned()
+                        };
+                        nk.key.objectid >= inode
+                    } else {
+                        true
+                    };
+                    if kp.key.objectid <= inode && next_ge {
+                        stack.push(kp.blockptr);
+                    }
+                }
+                continue;
             }
 
-            if extent.type_ == BTRFS_FILE_EXTENT_INLINE {
-                let inline_data_ptr = data_ptr + mem::size_of::<BtrfsFileExtentItem>();
-                let inline_len = item.size as usize - mem::size_of::<BtrfsFileExtentItem>();
-                let slice =
-                    unsafe { slice::from_raw_parts(inline_data_ptr as *const u8, inline_len) };
-                return Ok(slice.to_vec());
-            } else if extent.type_ == BTRFS_FILE_EXTENT_REG {
-                // Regular extent: header + disk_bytenr(8) + disk_num_bytes(8) + offset(8) + num_bytes(8)
-                let reg_ptr = data_ptr + mem::size_of::<BtrfsFileExtentItem>();
-                let disk_bytenr_ptr = reg_ptr as *const u64;
-                let disk_bytenr = unsafe { disk_bytenr_ptr.read_unaligned() };
+            // Leaf: collect every EXTENT_DATA item for this inode.
+            for i in 0..header.nritems as usize {
+                let item = unsafe {
+                    (buf.as_ptr().add(items_start + i * mem::size_of::<BtrfsItem>())
+                        as *const BtrfsItem)
+                        .read_unaligned()
+                };
+                if item.key.objectid != inode || item.key.type_ != BTRFS_EXTENT_DATA_KEY {
+                    continue;
+                }
+                let data_ptr =
+                    buf.as_ptr() as usize + mem::size_of::<BtrfsHeader>() + item.offset as usize;
+                let extent = unsafe { (data_ptr as *const BtrfsFileExtentItem).read_unaligned() };
 
-                // offset 24 bytes from disk_bytenr_ptr for num_bytes
-                let num_bytes_ptr = unsafe { disk_bytenr_ptr.add(3) };
-                let num_bytes = unsafe { num_bytes_ptr.read_unaligned() };
-
-                if disk_bytenr == 0 {
-                    return Ok(Vec::new());
+                if extent.compression != 0 {
+                    crate::error!(
+                        "Btrfs: Compressed file detected (algo {}). Only uncompressed files supported.",
+                        extent.compression
+                    );
+                    return Err(Error::new(Status::UNSUPPORTED, ()));
                 }
 
-                // Read full extent (assuming contiguous for this simplified driver)
-                let read_size = num_bytes as usize;
-                let mut buf = vec![0u8; read_size];
+                if extent.type_ == BTRFS_FILE_EXTENT_INLINE {
+                    let inline_data_ptr = data_ptr + mem::size_of::<BtrfsFileExtentItem>();
+                    let inline_len = item.size as usize - mem::size_of::<BtrfsFileExtentItem>();
+                    let slice =
+                        unsafe { slice::from_raw_parts(inline_data_ptr as *const u8, inline_len) };
+                    return Ok(slice.to_vec());
+                } else if extent.type_ == BTRFS_FILE_EXTENT_REG {
+                    // header + disk_bytenr(8) + disk_num_bytes(8) + offset(8) + num_bytes(8)
+                    let reg_ptr = data_ptr + mem::size_of::<BtrfsFileExtentItem>();
+                    let disk_bytenr_ptr = reg_ptr as *const u64;
+                    let disk_bytenr = unsafe { disk_bytenr_ptr.read_unaligned() };
+                    let num_bytes = unsafe { disk_bytenr_ptr.add(3).read_unaligned() };
+                    let file_offset = item.key.offset;
 
-                self.read_logical(disk_bytenr, read_size, &mut buf)?;
-                return Ok(buf);
+                    if disk_bytenr == 0 {
+                        // Hole: a run of zeros at this file offset.
+                        frags.push((file_offset, vec![0u8; num_bytes as usize]));
+                        continue;
+                    }
+                    let read_size = num_bytes as usize;
+                    let mut fbuf = vec![0u8; read_size];
+                    self.read_logical(disk_bytenr, read_size, &mut fbuf)?;
+                    frags.push((file_offset, fbuf));
+                }
             }
         }
-        Err(Error::new(Status::NOT_FOUND, ()))
+
+        if frags.is_empty() {
+            return Err(Error::new(Status::NOT_FOUND, ()));
+        }
+
+        // Reassemble in file order. Extents are contiguous and non-overlapping;
+        // place each at its file_offset so any gap is zero-filled.
+        frags.sort_by_key(|(off, _)| *off);
+        let total = frags
+            .iter()
+            .map(|(off, d)| *off as usize + d.len())
+            .max()
+            .unwrap_or(0);
+        let mut out = vec![0u8; total];
+        for (off, data) in frags {
+            let start = off as usize;
+            out[start..start + data.len()].copy_from_slice(&data);
+        }
+        Ok(out)
     }
 
     pub fn find_file_in_dir(
@@ -673,49 +746,73 @@ impl<'a> Btrfs<'a> {
         name_to_find: &str,
     ) -> Result<Option<(u64, u8)>> {
         let node_size = self.sb.nodesize as usize;
-        let mut node_buf = vec![0u8; node_size];
+        let mut buf = vec![0u8; node_size];
 
-        // Start at FS root
-        self.read_logical(fs_root_logical, node_size, &mut node_buf)?;
-        let mut header = unsafe { (node_buf.as_ptr() as *const BtrfsHeader).read_unaligned() };
+        // Walk the whole tree: a directory's items live wherever the B-tree puts
+        // them, not only in the left-most leaf (the FS tree is one leaf, but a
+        // subvolume tree has many). Descend every node; scan every leaf. Prune to
+        // children whose key range can contain dir_objectid to keep it cheap.
+        let mut stack: Vec<u64> = vec![fs_root_logical];
+        while let Some(logical) = stack.pop() {
+            self.read_logical(logical, node_size, &mut buf)?;
+            let header = unsafe { (buf.as_ptr() as *const BtrfsHeader).read_unaligned() };
+            let items_start = mem::size_of::<BtrfsHeader>();
 
-        // Drill down to the left-most leaf for now (Simplified).
-        let mut leaf_buf = node_buf;
+            if header.level > 0 {
+                // Internal node: push children that may cover dir_objectid.
+                for i in 0..header.nritems as usize {
+                    let kp = unsafe {
+                        (buf.as_ptr().add(items_start) as *const BtrfsKeyPtr)
+                            .add(i)
+                            .read_unaligned()
+                    };
+                    // The child covers keys >= kp.key up to the next child's key.
+                    // Descend if this child's objectid <= dir_objectid and the next
+                    // child still starts at/below dir_objectid is false -> simplest
+                    // correct rule: descend unless this child starts past our id.
+                    // Descend when the next child still starts at or below our
+                    // objectid (>= not >): a directory with many entries spans
+                    // several internal slots that all carry the same objectid, so
+                    // a strict > would skip all but the last and lose entries.
+                    let next_ge = if i + 1 < header.nritems as usize {
+                        let nk = unsafe {
+                            (buf.as_ptr().add(items_start) as *const BtrfsKeyPtr)
+                                .add(i + 1)
+                                .read_unaligned()
+                        };
+                        nk.key.objectid >= dir_objectid
+                    } else {
+                        true
+                    };
+                    if kp.key.objectid <= dir_objectid && next_ge {
+                        stack.push(kp.blockptr);
+                    }
+                }
+                continue;
+            }
 
-        while header.level > 0 {
-            let ptrs_start = mem::size_of::<BtrfsHeader>();
-            let ptr_ptr = unsafe { leaf_buf.as_ptr().add(ptrs_start) };
-            let kp = unsafe { (ptr_ptr as *const BtrfsKeyPtr).read_unaligned() };
-
-            self.read_logical(kp.blockptr, node_size, &mut leaf_buf)?;
-            header = unsafe { (leaf_buf.as_ptr() as *const BtrfsHeader).read_unaligned() };
-        }
-
-        // Iterate items in leaf
-        let items_start = mem::size_of::<BtrfsHeader>();
-        for i in 0..header.nritems {
-            let item_offset = items_start + i as usize * mem::size_of::<BtrfsItem>();
-            let item = unsafe {
-                (leaf_buf.as_ptr().add(item_offset) as *const BtrfsItem).read_unaligned()
-            };
-
-            if item.key.objectid == dir_objectid
-                && (item.key.type_ == BTRFS_DIR_INDEX_KEY || item.key.type_ == BTRFS_DIR_ITEM_KEY)
-            {
-                let data_ptr = leaf_buf.as_ptr() as usize
-                    + mem::size_of::<BtrfsHeader>()
-                    + item.offset as usize;
-                let dir_item = unsafe { (data_ptr as *const BtrfsDirItem).read_unaligned() };
-
-                let name_len = dir_item.name_len as usize;
-                let name_ptr = data_ptr + mem::size_of::<BtrfsDirItem>();
-
-                if name_ptr + name_len <= leaf_buf.as_ptr() as usize + node_size {
-                    let name_slice =
-                        unsafe { slice::from_raw_parts(name_ptr as *const u8, name_len) };
-
-                    if name_slice == name_to_find.as_bytes() {
-                        return Ok(Some((dir_item.location.objectid, dir_item.location.type_)));
+            // Leaf: scan items for the directory entry.
+            for i in 0..header.nritems as usize {
+                let item = unsafe {
+                    (buf.as_ptr().add(items_start + i * mem::size_of::<BtrfsItem>())
+                        as *const BtrfsItem)
+                        .read_unaligned()
+                };
+                if item.key.objectid == dir_objectid
+                    && (item.key.type_ == BTRFS_DIR_INDEX_KEY
+                        || item.key.type_ == BTRFS_DIR_ITEM_KEY)
+                {
+                    let data_ptr =
+                        buf.as_ptr() as usize + mem::size_of::<BtrfsHeader>() + item.offset as usize;
+                    let dir_item = unsafe { (data_ptr as *const BtrfsDirItem).read_unaligned() };
+                    let name_len = dir_item.name_len as usize;
+                    let name_ptr = data_ptr + mem::size_of::<BtrfsDirItem>();
+                    if name_ptr + name_len <= buf.as_ptr() as usize + node_size {
+                        let name_slice =
+                            unsafe { slice::from_raw_parts(name_ptr as *const u8, name_len) };
+                        if name_slice == name_to_find.as_bytes() {
+                            return Ok(Some((dir_item.location.objectid, dir_item.location.type_)));
+                        }
                     }
                 }
             }
