@@ -520,7 +520,7 @@ pub fn boot_linux_from_drive(
     // Use /dev/vda fallback for QEMU if UUID resolution fails in initrd (common in minimal dev envs)
     // Also add rootfstype=btrfs to prevent ext4 probe noise
     let default_cmdline = format!(
-        "root=UUID={} root=/dev/vda rw rootfstype=btrfs init=/Core/Bin/rev console=ttyS0",
+        "root=UUID={} root=/dev/vda rw rootfstype=btrfs init=/Core/Bin/rev console=ttyS0 quiet loglevel=3",
         uuid
     );
 
