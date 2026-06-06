@@ -13,4 +13,5 @@ timeout "${1:-0}" qemu-system-x86_64 -machine accel=kvm:tcg -smp 2 -m 1536 \
   -drive if=pflash,format=raw,file=bios/OVMF_VARS.4m.fd \
   -drive format=raw,file=fat:rw:target/uefi/esp \
   -drive file=disk.img,if=none,id=drive0,format=raw -device virtio-blk-pci,drive=drive0 \
+  -netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
   -nographic -no-reboot
