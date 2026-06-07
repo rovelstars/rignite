@@ -17,22 +17,30 @@ cd "$(dirname "$0")"
 mkdir -p "$ROOT/Core/Startup"
 cp -f "$KERNEL" "$ROOT/Core/Startup/vmlinuz-runixos"
 
-# Init: kernel /dev/console resolves to tty0 (fbcon) with the baked cmdline, so
-# a headless serial boot sees nothing. Make PID 1 a brush script that runs the
-# WPA diag and redirects all output to the serial port, so -nographic captures
-# it. (rm the real rev binary first; ln -sf onto an existing file would nest.)
-DIAGCMD="${DIAG_CMD:-/Core/Bin/aetherctl wifi diag RunixOS password123}"
-rm -f "$ROOT/Core/Bin/rev"
-cat > "$ROOT/Core/Bin/rev" <<EOF
+# Init selection:
+# - Default: boot the REAL Rev (PID 1) shipped in the base image, which mounts
+#   the pseudo-filesystems, runs OOBE if there is no account, then a login
+#   session on the console (tty0 / fbcon). Boot the GUI (boot_runix_gui.sh) to
+#   interact.
+# - DIAG_CMD set: replace rev with a brush script that runs that command and
+#   redirects to the serial port, for headless wifi/diag testing on -nographic.
+if [ -n "$DIAG_CMD" ]; then
+    rm -f "$ROOT/Core/Bin/rev"
+    cat > "$ROOT/Core/Bin/rev" <<EOF
 #!/Core/Bin/brush
 export PATH=/Core/Bin
 exec >/dev/ttyS0 2>&1
 echo "=== RUNIXOS DIAG INIT ==="
-$DIAGCMD
+$DIAG_CMD
 echo "=== DIAG-DONE ==="
 while true; do /Core/Bin/sleep 5; done
 EOF
-chmod +x "$ROOT/Core/Bin/rev"
+    chmod +x "$ROOT/Core/Bin/rev"
+    echo "(diag init: $DIAG_CMD)"
+else
+    [ -x "$ROOT/Core/Bin/rev" ] || { echo "no real rev binary in base image"; exit 1; }
+    echo "(real Rev init: OOBE + login on console)"
+fi
 
 rm -f "$IMG"
 truncate -s 3G "$IMG"
