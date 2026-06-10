@@ -23,6 +23,7 @@ mkdir -p "$STAGE"/{proc,sys,dev}
 cp "$BIN" "$STAGE/init"
 zstd -dqf "$MODDIR/drivers/virtio/virtio_dma_buf.ko.zst"   -o "$STAGE/virtio_dma_buf.ko"
 zstd -dqf "$MODDIR/drivers/gpu/drm/virtio/virtio-gpu.ko.zst" -o "$STAGE/virtio-gpu.ko"
+zstd -dqf "$MODDIR/drivers/virtio/virtio_input.ko.zst"     -o "$STAGE/virtio_input.ko"
 
 INITRD=$(mktemp --suffix=.cpio.gz)
 trap 'rm -rf "$STAGE" "$INITRD"' EXIT
@@ -35,4 +36,5 @@ timeout 60 qemu-system-x86_64 \
   -kernel "$KERNEL" -initrd "$INITRD" \
   -append "console=ttyS0 panic=1 quiet" \
   -device virtio-gpu-pci \
+  -device virtio-keyboard-pci \
   -nographic -no-reboot 2>&1

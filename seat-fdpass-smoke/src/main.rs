@@ -25,6 +25,15 @@ const DRM_IOCTL_SET_MASTER: libc::c_ulong = 0x0000_641e; // _IO('d', 0x1e)
 const DRM_IOCTL_MODE_GETRESOURCES: libc::c_ulong = 0xC040_64A0; // _IOWR('d', 0xA0, drm_mode_card_res{64})
 const DRM_IOCTL_MODE_SETCRTC: libc::c_ulong = 0xC068_64A2; // _IOWR('d', 0xA2, drm_mode_crtc{104})
 
+// evdev ioctls (type 'E' = 0x45). Input nodes have no "master"; the seat job is
+// (a) only the active session may hold the fd, and (b) on VT switch the fd is
+// REVOKED so a backgrounded session cannot keep reading the keyboard. EVIOCREVOKE
+// is exactly logind's revoke-on-switch mechanism: it kills the open file
+// description, so the revoke lands on the compositor's SCM_RIGHTS dup too.
+const EVIOCGVERSION: libc::c_ulong = 0x8004_4501; // _IOR('E', 0x01, int)
+const EVIOCGNAME_256: libc::c_ulong = 0x8100_4506; // _IOC(R,'E',0x06,256)
+const EVIOCREVOKE: libc::c_ulong = 0x4004_4591; // _IOW('E', 0x91, int)
+
 const UNPRIV_UID: libc::uid_t = 65534; // nobody
 
 fn main() {
@@ -38,6 +47,7 @@ fn main() {
 
     load_module("/virtio_dma_buf.ko");
     load_module("/virtio-gpu.ko");
+    load_module("/virtio_input.ko");
 
     let card = match wait_for_card() {
         Some(c) => c,
@@ -65,6 +75,26 @@ fn main() {
         println!("[!] parent SET_MASTER failed: {} (auto-master may be in effect)", last_err());
     }
 
+    // Input device (virtio-keyboard). Optional: if none is present the input
+    // half is skipped, the DRM half still runs.
+    let event = wait_for_event();
+    let event_fd = match &event {
+        Some(p) => {
+            let f = open_rdwr_cloexec(p);
+            if f < 0 {
+                println!("[!] root open of {p} failed: {} (skipping input test)", last_err());
+                -1
+            } else {
+                println!("[+] parent (uid 0) opened input node {p}");
+                f
+            }
+        }
+        None => {
+            println!("[!] no /dev/input/event* found (skipping input test)");
+            -1
+        }
+    };
+
     // socketpair: parent keeps a, child keeps b.
     let mut sp: [libc::c_int; 2] = [0; 2];
     if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sp.as_mut_ptr()) } != 0 {
@@ -74,13 +104,13 @@ fn main() {
 
     match unsafe { libc::fork() } {
         -1 => fail(&format!("fork: {}", last_err())),
-        0 => child(child_sock, parent_sock, &card),
-        pid => parent(pid, parent_sock, child_sock, drm_fd),
+        0 => child(child_sock, parent_sock, &card, event.as_deref()),
+        pid => parent(pid, parent_sock, child_sock, drm_fd, event_fd),
     }
 }
 
 /// Unprivileged receiver: the compositor's role in rev.
-fn child(child_sock: RawFd, parent_sock: RawFd, card: &str) -> ! {
+fn child(child_sock: RawFd, parent_sock: RawFd, card: &str, event: Option<&str>) -> ! {
     unsafe { libc::close(parent_sock) };
 
     // Drop all privilege, exactly as a compositor would run.
@@ -159,7 +189,80 @@ fn child(child_sock: RawFd, parent_sock: RawFd, card: &str) -> ! {
         }
     }
 
+    // ----- input device half -----
+    if let Some(ev) = event {
+        ok &= child_input(child_sock, ev);
+    }
+
     std::process::exit(if ok { 0 } else { 3 });
+}
+
+/// Input fd-pass + revoke test, from the compositor's side.
+fn child_input(sock: RawFd, ev: &str) -> bool {
+    // CONTROL: unprivileged direct open must be denied.
+    let direct = open_rdwr_cloexec(ev);
+    if direct >= 0 {
+        unsafe { libc::close(direct) };
+        println!("[child] !! WARN: unprivileged direct open of {ev} SUCCEEDED -- node not restricted");
+    } else {
+        println!("[child] OK: direct open of {ev} denied ({}) -- fd-pass is required", last_err());
+    }
+
+    let fd = match recv_fd(sock) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("[child] FAIL: recv_fd (input): {e}");
+            return false;
+        }
+    };
+    println!("[child] received input fd {fd} via SCM_RIGHTS");
+
+    let mut ok = true;
+
+    // The passed fd is a usable evdev: read protocol version + device name.
+    let mut ver: i32 = 0;
+    if unsafe { libc::ioctl(fd, EVIOCGVERSION, &mut ver) } == 0 {
+        println!("[child] OK: EVIOCGVERSION on passed input fd -> 0x{ver:08x}");
+    } else {
+        println!("[child] FAIL: EVIOCGVERSION on passed input fd: {}", last_err());
+        ok = false;
+    }
+    match evdev_name(fd) {
+        Some(name) => println!("[child] OK: EVIOCGNAME on passed input fd -> \"{name}\""),
+        None => {
+            println!("[child] FAIL: EVIOCGNAME on passed input fd: {}", last_err());
+            ok = false;
+        }
+    }
+
+    // Tell the parent the input fd works, then wait for it to revoke.
+    write_byte(sock, 1);
+    let _ = read_byte(sock); // parent signals "revoked"
+
+    // After EVIOCREVOKE on the parent's copy, this fd must be dead (ENODEV).
+    // This is the VT-switch cutoff: a backgrounded session loses the keyboard.
+    if evdev_name(fd).is_none() {
+        let err = last_err().raw_os_error().unwrap_or(0);
+        if err == libc::ENODEV {
+            println!("[child] OK: after EVIOCREVOKE the passed input fd is dead (ENODEV) -- VT-switch cutoff works");
+        } else {
+            println!("[child] OK: after EVIOCREVOKE the passed input fd is unusable ({})", last_err());
+        }
+    } else {
+        println!("[child] FAIL: input fd still readable after EVIOCREVOKE -- revoke did not reach the passed fd");
+        ok = false;
+    }
+    ok
+}
+
+fn evdev_name(fd: RawFd) -> Option<String> {
+    let mut buf = [0u8; 256];
+    let n = unsafe { libc::ioctl(fd, EVIOCGNAME_256, buf.as_mut_ptr()) };
+    if n < 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(n as usize);
+    Some(String::from_utf8_lossy(&buf[..end]).into_owned())
 }
 
 /// Two-pass MODE_GETRESOURCES: first read counts, then fetch the crtc id array.
@@ -186,24 +289,51 @@ fn first_crtc_id(fd: RawFd) -> Option<(u32, u32)> {
 }
 
 /// Root sender: rev's role.
-fn parent(child_pid: libc::pid_t, parent_sock: RawFd, child_sock: RawFd, drm_fd: RawFd) -> ! {
+fn parent(child_pid: libc::pid_t, parent_sock: RawFd, child_sock: RawFd, drm_fd: RawFd, event_fd: RawFd) -> ! {
     unsafe { libc::close(child_sock) };
 
     if let Err(e) = send_fd(parent_sock, drm_fd) {
-        fail(&format!("send_fd: {e}"));
+        fail(&format!("send_fd (drm): {e}"));
     }
     println!("[parent] passed DRM fd to child via SCM_RIGHTS");
+
+    if event_fd >= 0 {
+        if let Err(e) = send_fd(parent_sock, event_fd) {
+            fail(&format!("send_fd (input): {e}"));
+        }
+        println!("[parent] passed input fd to child via SCM_RIGHTS");
+        // Wait for the child to confirm the input fd works, then revoke it --
+        // exactly what rev does on a VT switch away from this session.
+        let _ = read_byte(parent_sock);
+        let r = unsafe { libc::ioctl(event_fd, EVIOCREVOKE, 0) };
+        if r == 0 {
+            println!("[parent] EVIOCREVOKE on input fd ok -- access revoked for all holders");
+        } else {
+            println!("[parent] !! EVIOCREVOKE failed: {}", last_err());
+        }
+        write_byte(parent_sock, 1); // tell child to re-probe
+    }
 
     let mut status: libc::c_int = 0;
     unsafe { libc::waitpid(child_pid, &mut status, 0) };
     let code = if libc::WIFEXITED(status) { libc::WEXITSTATUS(status) } else { -1 };
 
     println!("\n=== RESULT: {} (child exit {code}) ===",
-        if code == 0 { "PASS -- fd-pass carries DRM-master authority to an unprivileged peer" }
+        if code == 0 { "PASS -- fd-pass carries device authority to an unprivileged peer, and revoke cuts it off" }
         else { "FAIL" });
     println!("=== seat-fdpass-smoke done; powering off ===\n");
 
     sync_and_poweroff();
+}
+
+fn write_byte(fd: RawFd, b: u8) {
+    let buf = [b];
+    unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, 1) };
+}
+
+fn read_byte(fd: RawFd) -> i64 {
+    let mut buf = [0u8; 1];
+    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) as i64 }
 }
 
 // ----- send_fd / recv_fd: copied verbatim from rev/src/seat/fd_passing.rs -----
@@ -288,6 +418,22 @@ fn wait_for_card() -> Option<String> {
             }
         }
         unsafe { libc::usleep(25_000) }; // 25ms; up to ~3s total
+    }
+    None
+}
+
+fn wait_for_event() -> Option<String> {
+    for _ in 0..120 {
+        if let Ok(rd) = std::fs::read_dir("/dev/input") {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("event") {
+                    return Some(format!("/dev/input/{name}"));
+                }
+            }
+        }
+        unsafe { libc::usleep(25_000) };
     }
     None
 }
