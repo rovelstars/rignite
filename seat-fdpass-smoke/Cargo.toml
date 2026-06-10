@@ -1,0 +1,24 @@
+[package]
+name = "seat-fdpass-smoke"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone PID 1 for a tiny initramfs. It validates the exact thing rev's seat
+# layer relies on: a root process opens a restricted DRM node, passes the fd to
+# an unprivileged process via SCM_RIGHTS, and the passed fd carries DRM-master
+# authority the unprivileged process could never obtain on its own.
+[[bin]]
+name = "seat-fdpass-smoke"
+path = "src/main.rs"
+
+[dependencies]
+# Same crate rev uses for the SCM_RIGHTS send/recv path; the send_fd/recv_fd
+# functions below are copied verbatim from rev/src/seat/fd_passing.rs.
+nix = { version = "0.29", features = ["socket", "uio"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
