@@ -22,6 +22,7 @@ use std::os::unix::io::RawFd;
 // DRM ioctl request codes (asm-generic _IOC encoding, type 'd' = 0x64).
 const DRM_IOCTL_VERSION: libc::c_ulong = 0xC040_6400; // _IOWR('d', 0x00, drm_version{64})
 const DRM_IOCTL_SET_MASTER: libc::c_ulong = 0x0000_641e; // _IO('d', 0x1e)
+const DRM_IOCTL_DROP_MASTER: libc::c_ulong = 0x0000_641f; // _IO('d', 0x1f)
 const DRM_IOCTL_MODE_GETRESOURCES: libc::c_ulong = 0xC040_64A0; // _IOWR('d', 0xA0, drm_mode_card_res{64})
 const DRM_IOCTL_MODE_SETCRTC: libc::c_ulong = 0xC068_64A2; // _IOWR('d', 0xA2, drm_mode_crtc{104})
 
@@ -55,8 +56,20 @@ fn main() {
     };
     println!("[+] DRM node present: {card}");
 
+    // Two test modes, picked by kernel cmdline. Default: single-session fd-pass.
+    // smoke=multi: two-session VT-switch arbitration (master + input handoff).
+    if cmdline_has("smoke=multi") {
+        multi_session(&card, wait_for_event().as_deref());
+    } else {
+        single_session(&card);
+    }
+}
+
+/// Single-session: root opens a device, passes it to one unprivileged child,
+/// child drives it; plus the EVIOCREVOKE input cutoff.
+fn single_session(card: &str) -> ! {
     // Parent opens as root. First opener of a card node becomes DRM master.
-    let drm_fd = open_rdwr_cloexec(&card);
+    let drm_fd = open_rdwr_cloexec(card);
     if drm_fd < 0 {
         fail(&format!("root open of {card} failed: {}", last_err()));
     }
@@ -104,7 +117,7 @@ fn main() {
 
     match unsafe { libc::fork() } {
         -1 => fail(&format!("fork: {}", last_err())),
-        0 => child(child_sock, parent_sock, &card, event.as_deref()),
+        0 => child(child_sock, parent_sock, card, event.as_deref()),
         pid => parent(pid, parent_sock, child_sock, drm_fd, event_fd),
     }
 }
@@ -334,6 +347,205 @@ fn write_byte(fd: RawFd, b: u8) {
 fn read_byte(fd: RawFd) -> i64 {
     let mut buf = [0u8; 1];
     unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) as i64 }
+}
+
+// ----- multi-session: two-session VT-switch arbitration -----
+//
+// Models what rev does across a VT switch between two seats/sessions. A root
+// arbiter (rev) opens the GPU and keyboard once per session and hands each
+// session its own fd. DRM master is exclusive -- only the foreground session
+// may modeset -- and on a switch the arbiter drops master + revokes input from
+// the outgoing session and grants them to the incoming one. Neither session is
+// privileged; the arbiter is the only thing that can flip the authority.
+
+const MS_DONE: u8 = 0;
+const MS_PROBE: u8 = 1;
+const MS_FRESH: u8 = 2;
+
+fn multi_session(card: &str, event: Option<&str>) -> ! {
+    println!("[+] multi-session VT-switch arbitration test");
+
+    // Root opens one card fd per session.
+    let a_card = open_rdwr_cloexec(card);
+    let b_card = open_rdwr_cloexec(card);
+    if a_card < 0 || b_card < 0 {
+        fail(&format!("opening {card} twice failed: {}", last_err()));
+    }
+
+    // Exclusivity: A becomes master; B must NOT be able to, even though the
+    // arbiter is root -- you cannot steal an existing master.
+    let am = unsafe { libc::ioctl(a_card, DRM_IOCTL_SET_MASTER, 0) };
+    let bm = unsafe { libc::ioctl(b_card, DRM_IOCTL_SET_MASTER, 0) };
+    let exclusivity_ok = am == 0 && bm != 0;
+    if exclusivity_ok {
+        println!("[+] exclusivity OK: A is master, B SET_MASTER denied ({})", last_err());
+    } else {
+        println!("[!] exclusivity FAIL: A set_master={am}, B set_master={bm} (a second opener took master)");
+        // Restore the intended state for the rest of the test.
+        unsafe { libc::ioctl(b_card, DRM_IOCTL_DROP_MASTER, 0) };
+        unsafe { libc::ioctl(a_card, DRM_IOCTL_SET_MASTER, 0) };
+    }
+
+    let (a_ev, b_ev) = match event {
+        Some(p) => (open_rdwr_cloexec(p), open_rdwr_cloexec(p)),
+        None => {
+            println!("[!] no input device; multi-session runs DRM-only");
+            (-1, -1)
+        }
+    };
+
+    let (pa, ca) = socketpair_or_die();
+    let (pb, cb) = socketpair_or_die();
+
+    // Two unprivileged session children.
+    match unsafe { libc::fork() } {
+        -1 => fail(&format!("fork A: {}", last_err())),
+        0 => ms_child(ca, &[pa, pb, cb], "A"),
+        _ => {}
+    }
+    match unsafe { libc::fork() } {
+        -1 => fail(&format!("fork B: {}", last_err())),
+        0 => ms_child(cb, &[pa, pb, ca], "B"),
+        _ => {}
+    }
+    unsafe {
+        libc::close(ca);
+        libc::close(cb);
+    }
+
+    // Hand each session its own fds.
+    let _ = send_fd(pa, a_card);
+    if a_ev >= 0 { let _ = send_fd(pa, a_ev); }
+    let _ = send_fd(pb, b_card);
+    if b_ev >= 0 { let _ = send_fd(pb, b_ev); }
+
+    // Background B from the start: a non-foreground session must not read input.
+    if b_ev >= 0 { unsafe { libc::ioctl(b_ev, EVIOCREVOKE, 0) }; }
+
+    // Round 1: A foreground.
+    let a1 = probe(pa);
+    let b1 = probe(pb);
+
+    // VT switch A -> B: drop A's master + revoke A's input; give B master and a
+    // fresh input fd (the old one was revoked while it was backgrounded).
+    unsafe { libc::ioctl(a_card, DRM_IOCTL_DROP_MASTER, 0) };
+    if a_ev >= 0 { unsafe { libc::ioctl(a_ev, EVIOCREVOKE, 0) }; }
+    let b_set = unsafe { libc::ioctl(b_card, DRM_IOCTL_SET_MASTER, 0) };
+    println!("[+] switch A->B: dropped A master, B SET_MASTER = {b_set}");
+    if let Some(p) = event {
+        let fresh = open_rdwr_cloexec(p);
+        write_byte(pb, MS_FRESH);
+        let _ = send_fd(pb, fresh);
+    }
+
+    // Round 2: B foreground.
+    let a2 = probe(pa);
+    let b2 = probe(pb);
+
+    write_byte(pa, MS_DONE);
+    write_byte(pb, MS_DONE);
+    let mut st = 0;
+    unsafe { libc::waitpid(-1, &mut st, 0); libc::waitpid(-1, &mut st, 0) };
+
+    // Expected: foreground = (drm ok, input ok); background = (denied, dead).
+    let want_fg = (true, event.is_some());
+    let want_bg = (false, false);
+    let drm_ok = bool2(a1).0 && !bool2(b1).0 && !bool2(a2).0 && bool2(b2).0;
+    let in_ok = event.is_none()
+        || (bool2(a1).1 && !bool2(b1).1 && !bool2(a2).1 && bool2(b2).1);
+
+    println!("\n--- round 1 (A foreground): A={a1:?} B={b1:?}");
+    println!("--- round 2 (B foreground): A={a2:?} B={b2:?}");
+    println!("--- expected foreground={want_fg:?} background={want_bg:?}");
+    let pass = exclusivity_ok && b_set == 0 && drm_ok && in_ok;
+    println!("\n=== RESULT: {} ===",
+        if pass { "PASS -- DRM master + input handoff between two sessions works, master is exclusive" }
+        else { "FAIL" });
+    println!("=== seat-fdpass-smoke (multi) done; powering off ===\n");
+    sync_and_poweroff();
+}
+
+/// One unprivileged session. Receives its card + (optional) input fd, then
+/// answers PROBE rounds with (can-modeset, input-readable).
+fn ms_child(sock: RawFd, close_fds: &[RawFd], tag: &str) -> ! {
+    for &f in close_fds { unsafe { libc::close(f) }; }
+    unsafe {
+        libc::setgroups(0, std::ptr::null());
+        libc::setgid(UNPRIV_UID);
+        libc::setuid(UNPRIV_UID);
+    }
+
+    let card_fd = recv_fd(sock).unwrap_or(-1);
+    let mut input_fd = recv_fd(sock).unwrap_or(-1);
+    let crtc_id = if card_fd >= 0 { first_crtc_id(card_fd).map(|(id, _)| id).unwrap_or(0) } else { 0 };
+    println!("[child {tag}] dropped to uid {}, card_fd={card_fd} input_fd={input_fd}", unsafe { libc::geteuid() });
+
+    loop {
+        let mut b = [0u8; 1];
+        let n = unsafe { libc::read(sock, b.as_mut_ptr() as *mut libc::c_void, 1) };
+        if n <= 0 || b[0] == MS_DONE {
+            std::process::exit(0);
+        }
+        match b[0] {
+            MS_FRESH => {
+                input_fd = recv_fd(sock).unwrap_or(-1);
+            }
+            MS_PROBE => {
+                let drm_ok = setcrtc_master_ok(card_fd, crtc_id);
+                let in_ok = input_fd >= 0 && evdev_name(input_fd).is_some();
+                let out = [drm_ok as u8, in_ok as u8];
+                unsafe { libc::write(sock, out.as_ptr() as *const libc::c_void, 2) };
+            }
+            _ => {}
+        }
+    }
+}
+
+/// True if the fd is allowed to modeset (passed the DRM_MASTER gate).
+fn setcrtc_master_ok(card_fd: RawFd, crtc_id: u32) -> bool {
+    if card_fd < 0 || crtc_id == 0 {
+        return false;
+    }
+    let mut crtc = [0u8; 104];
+    crtc[12..16].copy_from_slice(&crtc_id.to_le_bytes());
+    let r = unsafe { libc::ioctl(card_fd, DRM_IOCTL_MODE_SETCRTC, crtc.as_mut_ptr()) };
+    if r == 0 {
+        return true;
+    }
+    let err = last_err().raw_os_error().unwrap_or(0);
+    // EACCES/EPERM/EBUSY = master gate rejected; anything else = past the gate.
+    !(err == libc::EACCES || err == libc::EPERM || err == libc::EBUSY)
+}
+
+/// Send PROBE and read the child's 2-byte (drm_ok, input_ok) reply.
+fn probe(sock: RawFd) -> (u8, u8) {
+    write_byte(sock, MS_PROBE);
+    let mut buf = [0u8; 2];
+    let mut got = 0;
+    while got < 2 {
+        let n = unsafe { libc::read(sock, buf[got..].as_mut_ptr() as *mut libc::c_void, 2 - got) };
+        if n <= 0 { break; }
+        got += n as usize;
+    }
+    (buf[0], buf[1])
+}
+
+fn bool2(t: (u8, u8)) -> (bool, bool) {
+    (t.0 != 0, t.1 != 0)
+}
+
+fn socketpair_or_die() -> (RawFd, RawFd) {
+    let mut sp: [libc::c_int; 2] = [0; 2];
+    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sp.as_mut_ptr()) } != 0 {
+        fail(&format!("socketpair: {}", last_err()));
+    }
+    (sp[0], sp[1])
+}
+
+fn cmdline_has(token: &str) -> bool {
+    std::fs::read_to_string("/proc/cmdline")
+        .map(|s| s.contains(token))
+        .unwrap_or(false)
 }
 
 // ----- send_fd / recv_fd: copied verbatim from rev/src/seat/fd_passing.rs -----
